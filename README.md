@@ -28,7 +28,8 @@ and licensing (GPL-3.0-only).
 | `deploy/` | systemd unit (one instance per camera) and example configuration files |
 | `vendor/napa-vision/` | napa-vision's C core (unmodified): the detector |
 | `vendor/apriltag/` | Upstream AprilTag family sources (unmodified), which the family generator reads |
-| `tools/` | Family table generator, SystemCore cross-build script |
+| `tools/` | Family table generator, SystemCore cross-build and release packaging scripts |
+| `.github/workflows/` | Release builds: bundles for SystemCore and desktop Linux |
 
 ## How frames flow
 
@@ -274,10 +275,28 @@ built-in default commented out. `--stream` and `--stream-overlay` take an option
 Building needs libclang (v4l2r generates its V4L2 bindings with bindgen) and a C compiler, for
 napa-vision's core.
 
+### Releases
+
+[Releases](https://github.com/compenguy/sonoma-vision/releases) carry a bundle per platform, each with
+the binary, this README, `LICENSE`, `NOTICE`, the field layouts (`fields/`) and the licenses of
+vendored code built in (`licenses/`):
+
+| Bundle | For |
+| --- | --- |
+| `sonoma-vision-<version>-systemcore.tar.gz` | SystemCore: tuned for its Cortex-A76, with `deploy/` (the systemd unit and example configuration) |
+| `sonoma-vision-<version>-linux-aarch64.tar.gz` | Other 64-bit Arm Linux |
+| `sonoma-vision-<version>-linux-x86_64.tar.gz` | x86-64 Linux |
+
+Each needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, SystemCore). Pushing a tag `v<version>`
+matching `Cargo.toml`'s version runs `.github/workflows/release.yml`, which tests, builds the bundles
+(`tools/package.sh`) and publishes the release; running the workflow by hand only builds them.
+
 ### SystemCore
 
-`tools/build-systemcore.sh` cross-compiles for aarch64. It needs `gcc-aarch64-linux-gnu` and
-`libc6-dev-arm64-cross` (see the script). The binary needs glibc 2.35 or newer. Then copy the binary to
+The SystemCore release bundle has everything below. To build it yourself instead,
+`tools/build-systemcore.sh` cross-compiles for aarch64 (it needs `gcc-aarch64-linux-gnu` and
+`libc6-dev-arm64-cross`; see the script), and `tools/package.sh aarch64-unknown-linux-gnu systemcore
+--deploy` bundles it. The binary needs glibc 2.35 or newer. Then copy the binary to
 `/usr/local/bin/`, the field layouts to `/usr/local/share/sonoma-vision/fields/`, the unit to `/etc/systemd/system/`, and the configuration to
 `/etc/sonoma-vision/`: `sonoma-vision.toml` with the settings every camera shares, and a file per
 camera (`cam0.toml`, with its device, table, stream port, calibration and pose on the robot) that the

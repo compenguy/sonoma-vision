@@ -1,0 +1,114 @@
+# Build distribution bundles for desktop Linux (x86-64, aarch64) and SystemCore.
+#
+# Pushing a tag `v<version>` (matching Cargo.toml's version) publishes a GitHub release with the
+# bundles. Running the workflow by hand builds them as workflow artifacts only.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    # Ubuntu 22.04's glibc (2.35) is the oldest the binaries run on: SystemCore's.
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+          - name: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+          # SystemCore (Raspberry Pi CM5): tuned for its Cortex-A76 cores, with the systemd unit and
+          # example configuration.
+          - name: systemcore
+            target: aarch64-unknown-linux-gnu
+            cpu: cortex-a76
+            package-args: --deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches Cargo.toml's version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match Cargo.toml's version $version"
+            exit 1
+          fi
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # bindgen (v4l2r's V4L2 bindings) needs libclang; aarch64 needs a cross toolchain and sysroot.
+          packages=libclang-dev
+          if [ "${{ matrix.target }}" = aarch64-unknown-linux-gnu ]; then
+            packages="$packages gcc-aarch64-linux-gnu libc6-dev-arm64-cross"
+          fi
+          sudo apt-get install -y --no-install-recommends $packages
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Test
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test --release --locked
+
+      - name: Build
+        env:
+          # Tuning for one CPU, when the bundle is for one: Rust code, and the C detector core (cc).
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.cpu && format('-C target-cpu={0}', matrix.cpu) || '' }}
+          CFLAGS_aarch64_unknown_linux_gnu: ${{ matrix.cpu && format('-mcpu={0}', matrix.cpu) || '' }}
+        run: |
+          # Drop debug info: the release profile keeps it for profiling.
+          args=(--locked --config 'profile.release.debug=0' --config 'profile.release.strip="debuginfo"')
+          if [ "${{ matrix.target }}" = aarch64-unknown-linux-gnu ]; then
+            tools/build-systemcore.sh "${args[@]}"
+          else
+            cargo build --release --target ${{ matrix.target }} "${args[@]}"
+          fi
+
+      - name: Package
+        run: tools/package.sh ${{ matrix.target }} ${{ matrix.name }} ${{ matrix.package-args }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "sonoma-vision $GITHUB_REF_NAME" \
+            --generate-notes

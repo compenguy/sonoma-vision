@@ -2,8 +2,11 @@
 name = "sonoma-vision"
 version = "0.1.0"
 edition = "2024"
-description = "Standalone AprilTag processor service for FRC SystemCore: V4L2 capture, napa-vision-style detection, NT4 publishing"
+description = "Standalone AprilTag processor service for FRC SystemCore: V4L2 capture, napa-vision detection, NT4 publishing"
 license = "GPL-3.0-only"
+repository = "https://github.com/compenguy/sonoma-vision"
+homepage = "https://github.com/compenguy/sonoma-vision"
+readme = "README.md"
 publish = false
 
 [features]
