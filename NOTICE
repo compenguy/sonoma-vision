@@ -13,6 +13,9 @@ The tag families' codewords (src/detector/families, generated from vendor/aprilt
 AprilTag (https://github.com/AprilRobotics/apriltag), Copyright (C) 2013-2016, The Regents of The
 University of Michigan, under the BSD 2-Clause license in vendor/apriltag/LICENSE.md and each file.
 
+vendor/linux-uapi holds Linux's V4L2 UAPI headers, used at build time to generate V4L2 bindings,
+under (GPL-2.0+ WITH Linux-syscall-note) OR BSD-3-Clause; see vendor/linux-uapi/README.md.
+
 The field layouts in fields/ come from WPILib, Copyright (c) 2009-2026 FIRST and other WPILib
 contributors, under the BSD 3-Clause license (https://github.com/wpilibsuite/allwpilib).
 

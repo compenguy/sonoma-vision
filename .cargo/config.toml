@@ -1,0 +1,4 @@
+[env]
+# v4l2r's bindings come from vendored V4L2 headers, not the build machine's, which may be too old
+# (see vendor/linux-uapi/README.md). v4l2r adds this directory to the include path.
+V4L2R_VIDEODEV2_H_PATH = { value = "vendor/linux-uapi", relative = true }
