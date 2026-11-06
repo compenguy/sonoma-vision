@@ -13,3 +13,4 @@ pub mod pose;
 pub mod settings;
 pub mod stream;
 pub mod synth;
+pub mod vision;

@@ -17,13 +17,15 @@ and licensing (GPL-3.0-only).
 | `src/detector/` | The detector: napa-vision's core behind a Rust API, luma views of frames, tag families |
 | `src/capture.rs` | V4L2 capture via [v4l2r](https://crates.io/crates/v4l2r), memory-mapped buffers |
 | `src/nt.rs` | NT4 publishing via [nt_client](https://crates.io/crates/nt_client) (patched, `vendor/`) |
-| `src/stream.rs` | Optional MJPEG camera stream for dashboards, with tag overlays |
+| `src/stream.rs` | Optional MJPEG camera stream for dashboards, with tag overlays, and `/config.toml` |
 | `src/settings.rs` | Settings that can be changed while running, over NT |
 | `src/pose/` | Pose solving: camera model, IPPE and refinement, field layouts |
-| `src/main.rs` | The service: a capture/detect thread feeding the NT publisher |
+| `src/config.rs` | `sonoma-vision.toml`: finding, reading and writing configuration files |
+| `src/vision.rs` | The vision thread: capture, detect and solve poses, applying live settings |
+| `src/main.rs` | The service: options, startup, and the vision thread feeding the NT publisher |
 | `src/synth.rs` | Synthetic frames with exact ground truth, for tests and benchmarks |
 | `fields/` | Field layouts (WPILib JSON), read at startup |
-| `deploy/` | systemd unit (one instance per camera) and an example config |
+| `deploy/` | systemd unit (one instance per camera) and example configuration files |
 | `vendor/napa-vision/` | napa-vision's C core (unmodified): the detector |
 | `vendor/apriltag/` | Upstream AprilTag family sources (unmodified), which the family generator reads |
 | `tools/` | Family table generator, SystemCore cross-build script |
