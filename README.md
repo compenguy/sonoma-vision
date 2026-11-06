@@ -1,19 +1,20 @@
 # sonoma-vision
 
-A standalone AprilTag processor service for the FRC SystemCore controller, in pure Rust. It captures
+A standalone AprilTag processor service for the FRC SystemCore controller, in Rust. It captures
 frames from a V4L2 (USB/UVC) camera, detects AprilTags, and publishes them over NetworkTables 4 to the
 robot program running on the same controller.
 
-The detector is a Rust implementation of [napa-vision](https://github.com/zwatx/NAPA)'s sparse-sampling design
-by Zachary Wilson: sample a sparse grid, skip regions without contrast, group dark runs into blobs,
-reject non-tags with a cheap early decode, and fit edges and decode only the tags, at full
-resolution. See [NOTICE](NOTICE) for credits and licensing (GPL-3.0-only).
+The detector is [napa-vision](https://github.com/zwatx/NAPA)'s C core by Zachary Wilson, vendored in
+`vendor/napa-vision/` and compiled in by `build.rs`. Its sparse-sampling design samples a sparse grid,
+skips regions without contrast, groups dark runs into blobs, rejects non-tags with a cheap early
+decode, and fits edges and decodes only the tags, at full resolution. See [NOTICE](NOTICE) for credits
+and licensing (GPL-3.0-only).
 
 ## Layout
 
 | Path | What |
 | --- | --- |
-| `src/detector/` | The detector: levels, thresholding and blobs, edge fitting, decoding, tag families |
+| `src/detector/` | The detector: napa-vision's core behind a Rust API, luma views of frames, tag families |
 | `src/capture.rs` | V4L2 capture via [v4l2r](https://crates.io/crates/v4l2r), memory-mapped buffers |
 | `src/nt.rs` | NT4 publishing via [nt_client](https://crates.io/crates/nt_client) (patched, `vendor/`) |
 | `src/stream.rs` | Optional MJPEG camera stream for dashboards, with tag overlays |
@@ -23,14 +24,16 @@ resolution. See [NOTICE](NOTICE) for credits and licensing (GPL-3.0-only).
 | `src/synth.rs` | Synthetic frames with exact ground truth, for tests and benchmarks |
 | `fields/` | Field layouts (WPILib JSON), read at startup |
 | `deploy/` | systemd unit (one instance per camera) and an example config |
-| `vendor/apriltag/` | Upstream AprilTag family sources (unmodified), which the generator reads |
+| `vendor/napa-vision/` | napa-vision's C core (unmodified): the detector |
+| `vendor/apriltag/` | Upstream AprilTag family sources (unmodified), which the family generator reads |
 | `tools/` | Family table generator, SystemCore cross-build script |
 
 ## How frames flow
 
-- **Zero copy.** The camera's driver buffers are memory-mapped, and each `Frame` borrows one in place.
-  GREY, YUYV, UYVY and NV12 frames are read by the detector directly: packed YUYV is a luma view with a
-  2-byte pixel pitch. MJPEG has to be decoded (one greyscale copy, about 0.4 ms at 720p on a desktop).
+- **Few copies.** The camera's driver buffers are memory-mapped, and each `Frame` borrows one in place.
+  GREY and NV12 frames are read by the detector directly. Packed YUYV and UYVY are luma views with a
+  2-byte pixel pitch, which the detector copies out to one byte per pixel (SIMD, about 0.05 ms at
+  1080p). MJPEG has to be decoded (one greyscale copy, about 0.4 ms at 720p on a desktop).
 - **Newest frame first.** Each request drains the driver's queue and returns the most recent frame,
   handing older ones back unread, so a slow frame never builds a backlog. Use 2–3 buffers.
 - **Capture timestamps.** Frames carry the driver's CLOCK_MONOTONIC capture time. The publisher maps it
@@ -201,7 +204,8 @@ cargo build --release
 `--family`, `--min-tag-px`, `--nt-server` (`local`, a team number, or an IPv4 address), `--table`,
 and the `--stream` options above.
 
-Building needs libclang: v4l2r generates its V4L2 bindings with bindgen.
+Building needs libclang (v4l2r generates its V4L2 bindings with bindgen) and a C compiler, for
+napa-vision's core.
 
 ### SystemCore
 
@@ -229,24 +233,29 @@ cargo run --release --example camera -- /dev/video0 640 480   # live capture and
 capture timestamps survive time sync; `tests/nt_settings.rs` checks live settings against one holding
 persisted values.
 
-Synthetic benchmark (`examples/bench.rs`, 40 frames per scenario, one desktop core; napa-vision's C detector
-on the same frames for reference):
+Synthetic benchmark (`examples/bench.rs`, 40 frames per scenario, each detected 5 times on one pinned
+desktop core, `BENCH_REPEAT=5 taskset -c 2`), with napa-vision built standalone by its own CMake and
+timed the same way on the same frames:
 
-| Scenario | Recall | Wrong IDs | Median / p95 corner error | Median time (NAPA C) |
+| Scenario | Recall | Wrong IDs | Median / p95 corner error | Median time (standalone NAPA) |
 | --- | ---: | ---: | ---: | ---: |
-| clean-640 | 100% | 0 | 0.016 / 0.045 px | 0.27 ms (0.11) |
-| small-1280 (32–48 px tags) | 100% | 0 | 0.032 / 0.094 px | 0.65 ms (0.31) |
-| large-1280 | 100% | 0 | 0.021 / 0.044 px | 0.40 ms (0.14) |
-| perspective | 100% | 0 | 0.021 / 0.058 px | 0.53 ms (0.20) |
-| blur+noise | 100% | 0 | 0.116 / 0.301 px | 1.53 ms (0.41) |
-| clipped exposure | 100% | 0 | 0.038 / 0.129 px | 0.58 ms (0.24) |
-| empty-1920 | — | 0 | — | 0.38 ms (0.06) |
+| clean-640 | 100% | 0 | 0.016 / 0.045 px | 0.109 ms (0.100) |
+| small-1280 (32–48 px tags) | 100% | 0 | 0.032 / 0.094 px | 0.301 ms (0.286) |
+| large-1280 | 100% | 0 | 0.021 / 0.044 px | 0.134 ms (0.126) |
+| perspective | 100% | 0 | 0.021 / 0.058 px | 0.195 ms (0.182) |
+| blur+noise | 100% | 0 | 0.115 / 0.301 px | 0.437 ms (0.423) |
+| clipped exposure | 100% | 0 | 0.038 / 0.130 px | 0.259 ms (0.239) |
+| empty-1920 | — | 0 | — | 0.066 ms (0.062) |
 
-Accuracy matches NAPA's C detector; it is 2–6× slower, without hand-written SIMD.
+Detections are identical to standalone NAPA's (every ID and corner, to six decimals); the wrapper
+costs 3–9%. Packed YUYV (`BENCH_YUYV=1`) costs a further 10–60 µs a frame, copying out the luma.
+`examples/bench.rs` prints a checksum of every detection, to confirm a change alters nothing, and
+`BENCH_DETECTIONS=file` writes them out for comparing against other detectors.
 
 ## Regenerating the tag families
 
-`src/detector/families/` is generated from upstream AprilTag's family sources, vendored unmodified
+`src/detector/families/` (the codes `src/synth.rs` draws tags from; a test checks they match
+napa-vision's own tables) is generated from upstream AprilTag's family sources, vendored unmodified
 in `vendor/apriltag/` (see its README for the commit):
 
 ```sh

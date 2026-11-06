@@ -4,8 +4,8 @@ Copyright (c) 2026 William Page
 sonoma-vision is free software under the GNU General Public License, version 3 only (GPL-3.0-only);
 see LICENSE.
 
-The AprilTag detector in src/detector is based on NAPA, Copyright (c) 2026 Zachary Wilson
-(https://github.com/zwatx/NAPA), used under the GPL-3.0-only. As NAPA's additional term under
+The AprilTag detector is NAPA's C core (vendor/napa-vision, unmodified), Copyright (c) 2026 Zachary
+Wilson (https://github.com/zwatx/NAPA), used under the GPL-3.0-only. As NAPA's additional term under
 section 7(b) of the GPL requires, works based on NAPA must keep this notice and credit Zachary Wilson
 as NAPA's author in their Appropriate Legal Notices.
 

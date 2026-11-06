@@ -11,6 +11,9 @@ default = ["mjpeg"]
 # Decode MJPEG camera frames (a copy per frame; GREY, YUYV, UYVY and NV12 are read in place).
 mjpeg = ["dep:zune-jpeg"]
 
+[build-dependencies]
+cc = "1"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4.6", features = ["derive", "env"] }

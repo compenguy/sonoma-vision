@@ -145,3 +145,21 @@ fn empty_and_tiny_frames() {
     assert!(det.detect(&ImageView::gray(&noise, 320, 240).unwrap()).is_empty());
     assert!(det.detect(&ImageView::gray(&[0; 100], 10, 10).unwrap()).is_empty());
 }
+
+#[test]
+fn packed_luma_matches_gray() {
+    // A YUYV-style frame (luma at every other byte) goes to napa-vision's core through a copy: it must
+    // see the same image.
+    let mut det = Detector::new(&families::TAG36H11, &Config::default()).unwrap();
+    let mut rng = Rng::new(21);
+    let mut tags = 0;
+    for i in 0..10 {
+        let s = scene(&mut rng, &families::TAG36H11, 640, 480, (40.0, 120.0), 0.8, 2.0);
+        let gray = det.detect(&ImageView::gray(&s.gray, s.width, s.height).unwrap());
+        let yuyv: Vec<u8> = s.gray.iter().flat_map(|&y| [y, 128]).collect();
+        let packed = det.detect(&ImageView::new(&yuyv, s.width, s.height, 2 * s.width, 2).unwrap());
+        assert_eq!(packed, gray, "frame {i}");
+        tags += gray.len();
+    }
+    assert!(tags > 10, "only {tags} tags");
+}

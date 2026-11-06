@@ -3,7 +3,12 @@
 //!     cargo run --release --example bench [frames] [pgm-dir]
 //!
 //! With `pgm-dir`, every frame is also written there as PGM (with a `truth.txt`), for comparing other
-//! detectors on the same frames.
+//! detectors on the same frames. `BENCH_REPEAT=k` detects each frame k times (timing each), so a
+//! profile is of the detector rather than of drawing frames. The last line is a checksum of every
+//! detection (IDs and corners' exact bits), to confirm an optimisation changes nothing.
+//! `BENCH_DETECTIONS=file` writes every detection (`frame id x0 y0 ... x3 y3`), with `pgm-dir`'s
+//! frame names, for comparing against other detectors. `BENCH_YUYV=1` hands frames over as packed YUYV
+//! (luma at every other byte).
 
 use std::fmt::Write as _;
 use std::time::Instant;
@@ -149,8 +154,19 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let frames: usize = args.next().map_or(50, |a| a.parse().expect("frames"));
     let dump = args.next().map(std::path::PathBuf::from);
+    let mut detections_txt = std::env::var_os("BENCH_DETECTIONS").map(|p| (p, String::new()));
+    let repeat: usize = std::env::var("BENCH_REPEAT").map_or(1, |r| r.parse().expect("BENCH_REPEAT"));
+    let yuyv = std::env::var_os("BENCH_YUYV").is_some();
     let mut det = Detector::new(&families::TAG36H11, &Config::default()).unwrap();
+    let mut packed = Vec::new();
     let mut truth_txt = String::new();
+    // FNV-1a over every detection's id and corner bits.
+    let mut checksum = 0xcbf29ce484222325u64;
+    let mut mix = |v: u64| {
+        for b in v.to_le_bytes() {
+            checksum = (checksum ^ u64::from(b)).wrapping_mul(0x100000001b3);
+        }
+    };
     println!(
         "{:<12} {:>5} {:>7} {:>6} {:>8} {:>8} {:>8} {:>8}",
         "scenario", "tags", "recall", "wrong", "med px", "p95 px", "med ms", "max ms"
@@ -171,12 +187,26 @@ fn main() {
                     writeln!(truth_txt, "{name} {} {c}", t.id).unwrap();
                 }
             }
-            let img = ImageView::gray(&gray, sc.width, sc.height).unwrap();
-            let t0 = Instant::now();
-            det.detect_into(&img, &mut out);
-            times.push(t0.elapsed().as_secs_f64() * 1e3);
+            let img = if yuyv {
+                packed.clear();
+                packed.extend(gray.iter().flat_map(|&y| [y, 128]));
+                ImageView::new(&packed, sc.width, sc.height, 2 * sc.width, 2).unwrap()
+            } else {
+                ImageView::gray(&gray, sc.width, sc.height).unwrap()
+            };
+            for _ in 0..repeat.max(1) {
+                let t0 = Instant::now();
+                det.detect_into(&img, &mut out);
+                times.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
             tags += truth.len();
             for d in &out {
+                if let Some((_, txt)) = &mut detections_txt {
+                    let c = d.corners.iter().flatten().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(" ");
+                    writeln!(txt, "{}-{f:03}.pgm {} {c}", sc.name, d.id).unwrap();
+                }
+                mix(u64::from(d.id));
+                d.corners.iter().flatten().for_each(|c| mix(c.to_bits()));
                 let c = d.center();
                 let hit = truth.iter().find(|t| {
                     let tc = t.corners.iter().fold([0.0, 0.0], |a, p| [a[0] + p[0] / 4.0, a[1] + p[1] / 4.0]);
@@ -199,7 +229,7 @@ fn main() {
         times.sort_by(f64::total_cmp);
         let pct = |v: &[f64], p: f64| if v.is_empty() { f64::NAN } else { v[((v.len() - 1) as f64 * p) as usize] };
         println!(
-            "{:<12} {:>5} {:>6.1}% {:>6} {:>8.3} {:>8.3} {:>8.2} {:>8.2}",
+            "{:<12} {:>5} {:>6.1}% {:>6} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
             sc.name,
             tags,
             if tags > 0 { 100.0 * found as f64 / tags as f64 } else { 100.0 },
@@ -209,6 +239,10 @@ fn main() {
             pct(&times, 0.5),
             pct(&times, 1.0),
         );
+    }
+    println!("checksum {checksum:016x}");
+    if let Some((path, txt)) = detections_txt {
+        std::fs::write(path, txt).expect("write detections");
     }
     if let Some(dir) = &dump {
         std::fs::write(dir.join("truth.txt"), truth_txt).expect("write truth");
