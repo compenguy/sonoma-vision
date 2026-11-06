@@ -2,7 +2,7 @@
 
 /// An AprilTag family: a square `width` cells across whose outer ring is the border, a one-cell
 /// quiet ring around it, and data cells inside the square (and, for some families, outside the quiet
-/// ring). Bit k of a code, most significant first, is cell (x[k], y[k]) relative to the square's
+/// ring). Bit k of a code, most significant first, is cell (`x[k]`, `y[k]`) relative to the square's
 /// top-left cell; a set bit is a white printed cell. Reversed families print the square's border white
 /// inside a dark frame and are detected on the inverted image.
 #[derive(Debug)]

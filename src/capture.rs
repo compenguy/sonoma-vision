@@ -54,9 +54,23 @@ impl Layout {
         Self::ALL.into_iter().find(|l| PixelFormat::from(l.fourcc()) == f)
     }
 
-    /// Whether the detector reads frames of this layout in place.
-    pub fn zero_copy(self) -> bool {
-        self != Layout::Mjpeg
+    /// Whether frames must be decoded (a copy per frame) before detection, rather than read as luma
+    /// in the driver's buffer.
+    pub fn decoded(self) -> bool {
+        self == Layout::Mjpeg
+    }
+
+    /// The fewest bytes a frame of this layout holds: through the last row's last luma byte. None for
+    /// a compressed layout, whose size varies.
+    pub fn min_len(self, width: usize, height: usize, stride: usize) -> Option<usize> {
+        let rows = stride * (height - 1);
+        match self {
+            Layout::Grey | Layout::Nv12 => Some(rows + width),
+            // Luma at even bytes (YUYV) or odd bytes (UYVY).
+            Layout::Yuyv => Some(rows + 2 * width - 1),
+            Layout::Uyvy => Some(rows + 2 * width),
+            Layout::Mjpeg => None,
+        }
     }
 }
 
@@ -356,14 +370,9 @@ impl Camera {
             FormatIterator::new(&self.fd, QUEUE).filter_map(|f| Layout::from_fourcc(f.pixelformat)).collect();
         for layout in Layout::ALL.into_iter().filter(|l| offered.contains(l)) {
             let pf = PixelFormat::from(layout.fourcc());
-            let sizes =
-                (0..).map_while(|i| ioctl::enum_frame_sizes::<bindings::v4l2_frmsizeenum>(&self.fd, i, pf).ok());
-            for size in sizes.filter_map(|e| SizeRange::from_enum(&e)) {
+            for size in frame_sizes(&self.fd, pf) {
                 let SizeRange::Discrete(width, height) = size else { continue };
-                let rates = (0..).map_while(|i| {
-                    ioctl::enum_frame_intervals::<bindings::v4l2_frmivalenum>(&self.fd, i, pf, width, height).ok()
-                });
-                for rate in rates.filter_map(|e| RateRange::from_enum(&e)) {
+                for rate in frame_rates(&self.fd, pf, width, height) {
                     let fps = rate.max_fps().round() as u32;
                     let mode = Mode { width, height, fps, layout };
                     if fps > 0 && !modes.contains(&mode) {
@@ -468,7 +477,7 @@ impl Camera {
         }
         let tv = buf.timestamp();
         let timestamp = Duration::new(tv.tv_sec as u64, tv.tv_usec as u32 * 1000);
-        if self.layout.zero_copy() && data.len() < self.stride * (self.height - 1) + self.width {
+        if self.layout.min_len(self.width, self.height, self.stride).is_some_and(|n| data.len() < n) {
             warn!("short frame ({} bytes), skipped", data.len());
             return Ok(None);
         }
@@ -518,10 +527,7 @@ fn pick_layout(offered: &[Layout], fits: impl Fn(Layout) -> Result<(), String>) 
 /// Whether the camera lists `layout` at `width`x`height` (and `fps`, if given); Err says why not.
 fn mode_fits(fd: &File, layout: Layout, width: u32, height: u32, fps: Option<u32>) -> Result<(), String> {
     let pf = PixelFormat::from(layout.fourcc());
-    let sizes: Vec<SizeRange> = (0..)
-        .map_while(|i| ioctl::enum_frame_sizes::<bindings::v4l2_frmsizeenum>(fd, i, pf).ok())
-        .filter_map(|e| SizeRange::from_enum(&e))
-        .collect();
+    let sizes = frame_sizes(fd, pf);
     if sizes.is_empty() {
         return Ok(()); // not listed: unknown
     }
@@ -529,10 +535,7 @@ fn mode_fits(fd: &File, layout: Layout, width: u32, height: u32, fps: Option<u32
         return Err(format!("not offered at {width}x{height}"));
     }
     let Some(fps) = fps else { return Ok(()) };
-    let rates: Vec<RateRange> = (0..)
-        .map_while(|i| ioctl::enum_frame_intervals::<bindings::v4l2_frmivalenum>(fd, i, pf, width, height).ok())
-        .filter_map(|e| RateRange::from_enum(&e))
-        .collect();
+    let rates = frame_rates(fd, pf, width, height);
     if rates.is_empty() || rates.iter().any(|r| r.reaches(fps)) {
         Ok(())
     } else {
@@ -541,9 +544,25 @@ fn mode_fits(fd: &File, layout: Layout, width: u32, height: u32, fps: Option<u32
     }
 }
 
+/// The frame sizes a camera lists for a pixel format (none if it doesn't list them).
+pub fn frame_sizes(fd: &impl AsRawFd, format: PixelFormat) -> Vec<SizeRange> {
+    (0..)
+        .map_while(|i| ioctl::enum_frame_sizes::<bindings::v4l2_frmsizeenum>(fd, i, format).ok())
+        .filter_map(|e| SizeRange::from_enum(&e))
+        .collect()
+}
+
+/// The frame rates a camera lists for a pixel format at one size (none if it doesn't list them).
+pub fn frame_rates(fd: &impl AsRawFd, format: PixelFormat, width: u32, height: u32) -> Vec<RateRange> {
+    (0..)
+        .map_while(|i| ioctl::enum_frame_intervals::<bindings::v4l2_frmivalenum>(fd, i, format, width, height).ok())
+        .filter_map(|e| RateRange::from_enum(&e))
+        .collect()
+}
+
 /// Frame sizes a format is listed at.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum SizeRange {
+pub enum SizeRange {
     Discrete(u32, u32),
     /// min, max and step of width, then of height.
     Steps([u32; 3], [u32; 3]),
@@ -560,7 +579,7 @@ impl SizeRange {
         })
     }
 
-    fn contains(&self, width: u32, height: u32) -> bool {
+    pub fn contains(&self, width: u32, height: u32) -> bool {
         let within = |v: u32, [lo, hi, step]: [u32; 3]| (lo..=hi).contains(&v) && (v - lo).is_multiple_of(step.max(1));
         match *self {
             Self::Discrete(w, h) => (w, h) == (width, height),
@@ -571,7 +590,7 @@ impl SizeRange {
 
 /// Frame intervals a format is listed at, for one size: the shortest interval gives the highest rate.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum RateRange {
+pub enum RateRange {
     /// An interval of numerator/denominator seconds.
     Discrete(u32, u32),
     /// The shortest interval of a range, numerator/denominator seconds.
@@ -587,7 +606,8 @@ impl RateRange {
         })
     }
 
-    fn max_fps(&self) -> f64 {
+    /// The fastest frame rate, in frames per second.
+    pub fn max_fps(&self) -> f64 {
         let (Self::Discrete(n, d) | Self::Shortest(n, d)) = *self;
         if n == 0 { 0.0 } else { f64::from(d) / f64::from(n) }
     }
@@ -635,6 +655,20 @@ mod tests {
         assert_eq!(pick_layout(&offered, fits), Some((Layout::Mjpeg, true)));
         // Nothing fits: the most preferred, for the driver to adjust.
         assert_eq!(pick_layout(&offered, |_| Err(String::new())), Some((Layout::Nv12, false)));
+    }
+
+    #[test]
+    fn minimum_frame_lengths() {
+        // 4x2 frames, rows 10 bytes apart: through the second row's last luma byte.
+        assert_eq!(Layout::Grey.min_len(4, 2, 10), Some(14));
+        assert_eq!(Layout::Yuyv.min_len(4, 2, 10), Some(17), "Y0 U Y1 V Y2 U Y3: 7 bytes");
+        assert_eq!(Layout::Uyvy.min_len(4, 2, 10), Some(18), "U Y0 V Y1 U Y2 V Y3: 8 bytes");
+        assert_eq!(Layout::Mjpeg.min_len(4, 2, 10), None);
+        // Exactly that much is enough for the detector's view of it.
+        let data = [0u8; 18];
+        let (w, h, stride) = (4, 2, 10);
+        assert!(crate::detector::ImageView::new(&data[..17], w, h, stride, 2).is_ok());
+        assert!(crate::detector::ImageView::new(&data[1..18], w, h, stride, 2).is_ok());
     }
 
     #[test]

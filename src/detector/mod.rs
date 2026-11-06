@@ -32,9 +32,15 @@ pub struct Config {
     pub sharpening: f64,
 }
 
+impl Config {
+    /// The defaults, as a constant for others' defaults to build on.
+    pub const DEFAULT: Config =
+        Config { min_tag_px: 32, max_hamming: None, min_contrast: 20, min_border_cells: 22, sharpening: 0.25 };
+}
+
 impl Default for Config {
     fn default() -> Self {
-        Self { min_tag_px: 32, max_hamming: None, min_contrast: 20, min_border_cells: 22, sharpening: 0.25 }
+        Self::DEFAULT
     }
 }
 

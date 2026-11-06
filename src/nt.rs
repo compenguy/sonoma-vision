@@ -11,7 +11,7 @@
 //! - `fps` (double), `detect_ms` (double), `dropped` (int, frames the camera skipped since start).
 //! - `tags/<id>/` for each tag ID seen, for dashboards: `visible` (boolean), `margin` (double, one
 //!   decimal), `hamming` (int), `center_x` and `center_y` (double, pixels, one decimal), and `corners`
-//!   (double[8], x0, y0 ... x3, y3). Values are timestamped with the capture time and kept when the
+//!   (`double[8]`, x0, y0 ... x3, y3). Values are timestamped with the capture time and kept when the
 //!   tag leaves view; `visible` turns false. If a frame has a tag ID twice, the clearer one is used.
 //!   With its pose solved, also `distance` (m), `bearing` (degrees, left positive), `ambiguity`, and
 //!   `camera_to_tag` (struct Transform3d: the tag's pose in the camera's frame).

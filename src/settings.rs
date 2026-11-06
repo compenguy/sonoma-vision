@@ -6,10 +6,38 @@
 //! command line option, so the configuration in effect can be written back out with the live values
 //! (see [`Settings::config_overrides`]).
 
+use std::ops::RangeInclusive;
+
 use rmpv::Value;
 
 use crate::capture::Mode;
+use crate::detector;
 use crate::pose::MountPose;
+
+/// Each numeric setting's valid values, for the command line and NT alike.
+pub mod limits {
+    use std::ops::RangeInclusive;
+
+    pub const MIN_CONTRAST: RangeInclusive<i64> = 1..=255;
+    pub const MIN_TAG_PX: RangeInclusive<i64> = 8..=30000;
+    pub const MAX_HAMMING: RangeInclusive<i64> = 0..=3;
+    pub const MIN_BORDER_CELLS: RangeInclusive<i64> = 0..=28;
+    pub const STREAM_QUALITY: RangeInclusive<i64> = 1..=100;
+    pub const STREAM_SCALE: RangeInclusive<i64> = 1..=8;
+    pub const SHARPENING: RangeInclusive<f64> = 0.0..=1.0;
+    pub const MAX_AMBIGUITY: RangeInclusive<f64> = 0.0..=1.0;
+    pub const STREAM_GAMMA: RangeInclusive<f64> = 0.1..=10.0;
+    pub const STREAM_FPS: RangeInclusive<f64> = 0.1..=1000.0;
+
+    /// A command line parser for a number within `range`.
+    pub fn decimal(range: RangeInclusive<f64>) -> impl Fn(&str) -> Result<f64, String> + Clone + Send + Sync {
+        move |s| match s.parse::<f64>() {
+            Ok(v) if range.contains(&v) => Ok(v),
+            Ok(_) => Err(format!("{s} is not in {}..={}", range.start(), range.end())),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
@@ -51,28 +79,33 @@ pub struct Settings {
     pub capture_mode: Option<Mode>,
 }
 
+impl Settings {
+    /// The built-in defaults, which the command line's options default to as well.
+    pub const DEFAULT: Settings = Settings {
+        exposure: None,
+        gain: None,
+        focus: None,
+        min_contrast: detector::Config::DEFAULT.min_contrast,
+        min_tag_px: detector::Config::DEFAULT.min_tag_px,
+        max_hamming: detector::Config::DEFAULT.max_hamming,
+        min_border_cells: detector::Config::DEFAULT.min_border_cells,
+        sharpening: detector::Config::DEFAULT.sharpening,
+        max_ambiguity: 0.2,
+        robot_to_camera: MountPose([0.0; 6]),
+        stream_auto_levels: true,
+        stream_gamma: 1.0,
+        stream_overlay: false,
+        stream_quality: 50,
+        stream_fps: 15.0,
+        stream_scale: 1,
+        field_layout: None,
+        capture_mode: None,
+    };
+}
+
 impl Default for Settings {
     fn default() -> Self {
-        Self {
-            exposure: None,
-            gain: None,
-            focus: None,
-            min_contrast: 20,
-            min_tag_px: 32,
-            max_hamming: None,
-            min_border_cells: 22,
-            sharpening: 0.25,
-            max_ambiguity: 0.2,
-            robot_to_camera: MountPose::default(),
-            stream_auto_levels: true,
-            stream_gamma: 1.0,
-            stream_overlay: false,
-            stream_quality: 50,
-            stream_fps: 15.0,
-            stream_scale: 1,
-            field_layout: None,
-            capture_mode: None,
-        }
+        Self::DEFAULT
     }
 }
 
@@ -198,38 +231,39 @@ impl Settings {
         let name = key.name();
         let as_number = |v: &Value| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64));
         let number = || as_number(value);
-        let int = |lo: i64, hi: i64| match number() {
-            Some(v) if v.fract() == 0.0 && (lo as f64..=hi as f64).contains(&v) => Ok(v as i64),
-            _ => Err(format!("{name} must be a whole number from {lo} to {hi}, not {value}")),
+        let int = |range: RangeInclusive<i64>| match number() {
+            Some(v) if v.fract() == 0.0 && (*range.start() as f64..=*range.end() as f64).contains(&v) => Ok(v as i64),
+            _ => Err(format!("{name} must be a whole number from {} to {}, not {value}", range.start(), range.end())),
         };
-        let real = |lo: f64, hi: f64| match number() {
-            Some(v) if (lo..=hi).contains(&v) => Ok(v),
-            _ => Err(format!("{name} must be from {lo} to {hi}, not {value}")),
+        let real = |range: RangeInclusive<f64>| match number() {
+            Some(v) if range.contains(&v) => Ok(v),
+            _ => Err(format!("{name} must be from {} to {}, not {value}", range.start(), range.end())),
         };
         let boolean = || value.as_bool().ok_or_else(|| format!("{name} must be a boolean, not {value}"));
         // -1 (and, for exposure, 0, which no camera means as an exposure) is "the camera's own".
-        let camera_int = |min: i64| int(-1, i64::from(i32::MAX)).map(|v| Some(v as i32).filter(|&v| v >= min as i32));
+        let camera_int = |min: i64| int(-1..=i64::from(i32::MAX)).map(|v| Some(v as i32).filter(|&v| v >= min as i32));
         match key {
             Key::Exposure => self.exposure = camera_int(1)?,
             Key::Gain => self.gain = camera_int(0)?,
             Key::Focus => self.focus = camera_int(0)?,
-            Key::MinContrast => self.min_contrast = int(1, 255)? as u8,
-            Key::MinTagPx => self.min_tag_px = int(8, 30000)? as u32,
-            Key::MaxHamming => self.max_hamming = u32::try_from(int(-1, 3)?).ok(),
-            Key::MinBorderCells => self.min_border_cells = int(0, 28)? as u32,
-            Key::Sharpening => self.sharpening = real(0.0, 1.0)?,
-            Key::MaxAmbiguity => self.max_ambiguity = real(0.0, 1.0)?,
+            Key::MinContrast => self.min_contrast = int(limits::MIN_CONTRAST)? as u8,
+            Key::MinTagPx => self.min_tag_px = int(limits::MIN_TAG_PX)? as u32,
+            // -1: the family's recommendation.
+            Key::MaxHamming => self.max_hamming = u32::try_from(int(-1..=*limits::MAX_HAMMING.end())?).ok(),
+            Key::MinBorderCells => self.min_border_cells = int(limits::MIN_BORDER_CELLS)? as u32,
+            Key::Sharpening => self.sharpening = real(limits::SHARPENING)?,
+            Key::MaxAmbiguity => self.max_ambiguity = real(limits::MAX_AMBIGUITY)?,
             Key::RobotToCamera => {
                 let v: Option<Vec<f64>> = value.as_array().and_then(|a| a.iter().map(as_number).collect());
                 let v = v.ok_or_else(|| format!("{name} must be a double[6], not {value}"))?;
                 self.robot_to_camera = MountPose::from_slice(&v).map_err(|e| format!("{name}: {e}"))?;
             }
             Key::StreamAutoLevels => self.stream_auto_levels = boolean()?,
-            Key::StreamGamma => self.stream_gamma = real(0.1, 10.0)?,
+            Key::StreamGamma => self.stream_gamma = real(limits::STREAM_GAMMA)?,
             Key::StreamOverlay => self.stream_overlay = boolean()?,
-            Key::StreamQuality => self.stream_quality = int(1, 100)? as u8,
-            Key::StreamFps => self.stream_fps = real(0.1, 1000.0)?,
-            Key::StreamScale => self.stream_scale = int(1, 8)? as u8,
+            Key::StreamQuality => self.stream_quality = int(limits::STREAM_QUALITY)? as u8,
+            Key::StreamFps => self.stream_fps = real(limits::STREAM_FPS)?,
+            Key::StreamScale => self.stream_scale = int(limits::STREAM_SCALE)? as u8,
         }
         Ok(())
     }

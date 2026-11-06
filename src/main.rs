@@ -18,7 +18,7 @@ use sonoma_vision::nt::{self, CameraAdvert, FrameResult, NtConfig};
 use sonoma_vision::pose::camera::Intrinsics;
 use sonoma_vision::pose::field::{self, FieldLayout};
 use sonoma_vision::pose::{Estimator, FRC_TAG_SIZE, MountPose, PoseConfig};
-use sonoma_vision::settings::{NO_LAYOUT, Settings};
+use sonoma_vision::settings::{NO_LAYOUT, Settings, limits};
 use sonoma_vision::stream::{self, ConfigPage, StreamConfig, Tap};
 
 #[derive(clap::Parser, Debug)]
@@ -72,20 +72,20 @@ struct Args {
     #[arg(long, default_value = "tag36h11")]
     family: String,
     /// Smallest tag side (black square, pixels) to guarantee; smaller is slower. Live setting.
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = Settings::DEFAULT.min_tag_px, value_parser = clap::value_parser!(u32).range(limits::MIN_TAG_PX))]
     min_tag_px: u32,
     /// Grey levels required between tag black and white. Live setting.
-    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..))]
+    #[arg(long, default_value_t = Settings::DEFAULT.min_contrast, value_parser = clap::value_parser!(u8).range(limits::MIN_CONTRAST))]
     min_contrast: u8,
     /// Payload bits to correct (default: the family's recommendation; 3 for tag36h11). Live setting.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(limits::MAX_HAMMING))]
     max_hamming: Option<u32>,
     /// Dark border cells required for a tag, out of tag36h11's 28 (0-28); fewer accepts partly
     /// occluded or glared tags, and more false ones. Live setting.
-    #[arg(long, default_value_t = 22, value_parser = clap::value_parser!(u32).range(0..=28))]
+    #[arg(long, default_value_t = Settings::DEFAULT.min_border_cells, value_parser = clap::value_parser!(u32).range(limits::MIN_BORDER_CELLS))]
     min_border_cells: u32,
     /// Cell sharpening strength, 0-1, for blurred tags; upstream AprilTag uses 0.25. Live setting.
-    #[arg(long, default_value_t = 0.25)]
+    #[arg(long, default_value_t = Settings::DEFAULT.sharpening, value_parser = limits::decimal(limits::SHARPENING))]
     sharpening: f64,
 
     /// NT server: `local` (the robot program on this controller), a team number, or an IPv4 address.
@@ -109,24 +109,24 @@ struct Args {
     #[arg(long, default_value_t = 1190)]
     stream_port: u16,
     /// Most frames per second to stream (0.1-1000); the camera's rate is the upper limit. Live setting.
-    #[arg(long, default_value_t = 15.0)]
+    #[arg(long, default_value_t = Settings::DEFAULT.stream_fps, value_parser = limits::decimal(limits::STREAM_FPS))]
     stream_fps: f64,
     /// JPEG quality of the stream, 1-100. Live setting.
-    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u8).range(1..=100))]
+    #[arg(long, default_value_t = Settings::DEFAULT.stream_quality, value_parser = clap::value_parser!(u8).range(limits::STREAM_QUALITY))]
     stream_quality: u8,
     /// Divide the stream's width and height by this (1-8): 2 streams a 640x480 camera at 320x240.
     /// Live setting.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
+    #[arg(long, default_value_t = Settings::DEFAULT.stream_scale, value_parser = clap::value_parser!(u8).range(limits::STREAM_SCALE))]
     stream_scale: u8,
     /// Draw each detected tag's outline and ID on the stream. Live setting.
-    #[arg(long, value_name = "BOOL", num_args = 0..=1, default_value_t = false, default_missing_value = "true",
-          action = clap::ArgAction::Set)]
+    #[arg(long, value_name = "BOOL", num_args = 0..=1, default_value_t = Settings::DEFAULT.stream_overlay,
+          default_missing_value = "true", action = clap::ArgAction::Set)]
     stream_overlay: bool,
     /// Stretch each streamed frame to the full grey range (viewing only, not detection). Live setting.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(long, default_value_t = Settings::DEFAULT.stream_auto_levels, action = clap::ArgAction::Set)]
     stream_auto_levels: bool,
     /// Stream gamma, 0.1-10: above 1 lifts shadows (viewing only). Live setting.
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = Settings::DEFAULT.stream_gamma, value_parser = limits::decimal(limits::STREAM_GAMMA))]
     stream_gamma: f64,
     /// Camera name dashboards show (default: sonoma- and the table's last part, e.g. sonoma-cam0).
     #[arg(long)]
@@ -141,7 +141,7 @@ struct Args {
     #[arg(long, default_value_t = 70.0)]
     fov: f64,
     /// Side of the tag's black square, in metres (FRC: 6.5 in).
-    #[arg(long, default_value_t = FRC_TAG_SIZE)]
+    #[arg(long, default_value_t = FRC_TAG_SIZE, value_parser = positive)]
     tag_size: f64,
     /// Field layout for poses: the name of a layout in a `fields` directory (searched in
     /// /usr/share/sonoma-vision, /usr/local/share/sonoma-vision, the working directory, then beside
@@ -151,15 +151,24 @@ struct Args {
     field_layout: Option<String>,
     /// The camera's pose on the robot, WPILib's robot-to-camera transform: x,y,z in metres (forward,
     /// left, up from the robot's origin), then roll,pitch,yaw in degrees. Live setting.
-    #[arg(long, default_value = "0,0,0,0,0,0", allow_hyphen_values = true)]
+    #[arg(long, default_value_t = Settings::DEFAULT.robot_to_camera, allow_hyphen_values = true)]
     robot_to_camera: MountPose,
     /// Single-tag robot poses more ambiguous than this (0-1) aren't published. Live setting.
-    #[arg(long, default_value_t = 0.2)]
+    #[arg(long, default_value_t = Settings::DEFAULT.max_ambiguity, value_parser = limits::decimal(limits::MAX_AMBIGUITY))]
     max_ambiguity: f64,
 
     /// Log level, or an env_logger filter such as `info,sonoma_vision::nt=debug`.
     #[arg(long, default_value = "info")]
     log_level: String,
+}
+
+/// A command line parser for a positive number.
+fn positive(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if v > 0.0 && v.is_finite() => Ok(v),
+        Ok(_) => Err(format!("{s} is not positive")),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// The arguments, with configuration files' values as their defaults, and the files read.
@@ -185,10 +194,6 @@ fn main() -> Result<()> {
     let family = Family::by_name(&args.family).with_context(|| {
         format!("unknown family {:?}; one of {}", args.family, Family::names().collect::<Vec<_>>().join(", "))
     })?;
-    anyhow::ensure!((0.1..=10.0).contains(&args.stream_gamma), "--stream-gamma must be from 0.1 to 10");
-    anyhow::ensure!((0.1..=1000.0).contains(&args.stream_fps), "--stream-fps must be from 0.1 to 1000");
-    anyhow::ensure!((0.0..=1.0).contains(&args.max_ambiguity), "--max-ambiguity must be from 0 to 1");
-    anyhow::ensure!(args.max_hamming.is_none_or(|h| h <= 3), "--max-hamming must be from 0 to 3");
     let (layouts, field_layout) = field_layouts(args.field_layout.as_deref())?;
     let settings = Settings {
         exposure: args.exposure.filter(|&e| e > 0),
@@ -230,7 +235,6 @@ fn main() -> Result<()> {
         robot_to_camera: args.robot_to_camera.isometry(),
         max_ambiguity: args.max_ambiguity,
     };
-    anyhow::ensure!(args.tag_size > 0.0, "--tag-size must be positive");
     if pose.calibration.is_none() {
         warn!("no --calibration: approximating the camera from a {}° field of view; poses are rough", args.fov);
     }
@@ -296,8 +300,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Capture and detect until `stop`, reopening the camera after errors (e.g. a USB unplug), and apply
-/// live settings as they change.
 /// What the vision thread works with, fixed at startup.
 struct Setup {
     camera: CameraConfig,
@@ -385,6 +387,8 @@ fn build_estimator(
     }
 }
 
+/// Capture and detect until `stop`, reopening the camera after errors (e.g. a USB unplug) or to change
+/// the capture mode, and apply live settings as they change.
 fn vision_loop(
     setup: Setup,
     mut settings: watch::Receiver<Settings>,
@@ -427,7 +431,7 @@ fn vision_loop(
         let mut applied: Option<Settings> = None;
         // Built with the settings below, and rebuilt when the pose settings change.
         let mut estimator = None;
-        if !camera.layout.zero_copy() {
+        if camera.layout.decoded() {
             warn!("{:?} frames are decoded (one copy per frame); a raw format avoids it", camera.layout);
         }
         let mut last_seq: Option<u32> = None;
@@ -639,6 +643,53 @@ mod tests {
         let (back, _) = parse(&again, &[]);
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(format!("{back:?}"), format!("{args:?}"), "{text}");
+    }
+
+    #[test]
+    fn out_of_range_file_values_name_the_file_and_key() {
+        let dir = std::env::temp_dir().join(format!("sonoma-range-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("cam0.toml");
+        let cases = [
+            ("[stream]\ngamma = 20\n", "[stream] gamma", "20 is not in 0.1..=10"),
+            ("[stream]\nquality = 0\n", "[stream] quality", "0 is not in 1..=100"),
+            ("[detector]\nsharpening = 3\n", "[detector] sharpening", "3 is not in 0..=1"),
+            ("[detector]\nmax_hamming = 4\n", "[detector] max_hamming", "4 is not in 0..=3"),
+            ("[pose]\ntag_size = 0\n", "[pose] tag_size", "0 is not positive"),
+        ];
+        for (text, key, why) in cases {
+            std::fs::write(&file, text).unwrap();
+            let err = FileValues::load(&Args::command(), std::slice::from_ref(&file), &[]).unwrap_err();
+            let err = format!("{err:#}");
+            assert!(err.contains("cam0.toml") && err.contains(key) && err.contains(why), "{err}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn option_defaults_are_the_settings_defaults() {
+        let args = Args::from_arg_matches(&Args::command().try_get_matches_from(["sv"]).unwrap()).unwrap();
+        let d = Settings::DEFAULT;
+        assert_eq!(
+            (args.min_contrast, args.min_tag_px, args.max_hamming),
+            (d.min_contrast, d.min_tag_px, d.max_hamming)
+        );
+        assert_eq!(
+            (args.min_border_cells, args.sharpening, args.max_ambiguity),
+            (d.min_border_cells, d.sharpening, d.max_ambiguity)
+        );
+        assert_eq!(args.robot_to_camera, d.robot_to_camera);
+        assert_eq!(
+            (
+                args.stream_auto_levels,
+                args.stream_gamma,
+                args.stream_overlay,
+                args.stream_quality,
+                args.stream_fps,
+                args.stream_scale
+            ),
+            (d.stream_auto_levels, d.stream_gamma, d.stream_overlay, d.stream_quality, d.stream_fps, d.stream_scale)
+        );
     }
 
     #[test]
