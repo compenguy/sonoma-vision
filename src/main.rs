@@ -34,8 +34,8 @@ struct Args {
     /// Requested frame rate; the camera may choose another.
     #[arg(long)]
     fps: Option<u32>,
-    /// Pixel format: grey, yuyv, uyvy or nv12 (read in place) or mjpeg (decoded). Default: the first
-    /// of these the camera offers.
+    /// Pixel format: grey or nv12 (read in place), yuyv or uyvy (luma copied out), or mjpeg (decoded).
+    /// Default: the first of these, in that order, the camera offers at the requested size and rate.
     #[arg(long)]
     format: Option<Layout>,
     /// Driver buffers to cycle (2-4). Fewer means less queued latency.

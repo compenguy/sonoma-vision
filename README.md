@@ -34,6 +34,9 @@ and licensing (GPL-3.0-only).
   GREY and NV12 frames are read by the detector directly. Packed YUYV and UYVY are luma views with a
   2-byte pixel pitch, which the detector copies out to one byte per pixel (SIMD, about 0.05 ms at
   1080p). MJPEG has to be decoded (one greyscale copy, about 0.4 ms at 720p on a desktop).
+- **Format choice.** Without `--format`, the camera gets the first of GREY, NV12, YUYV, UYVY and MJPEG
+  that it lists at the requested size and `--fps`. Many UVC cameras list YUYV at large sizes only at
+  a few frames per second, where MJPEG reaches full rate; the log says why a format was passed over.
 - **Newest frame first.** Each request drains the driver's queue and returns the most recent frame,
   handing older ones back unread, so a slow frame never builds a backlog. Use 2–3 buffers.
 - **Capture timestamps.** Frames carry the driver's CLOCK_MONOTONIC capture time. The publisher maps it
@@ -247,8 +250,10 @@ timed the same way on the same frames:
 | clipped exposure | 100% | 0 | 0.038 / 0.130 px | 0.259 ms (0.239) |
 | empty-1920 | — | 0 | — | 0.066 ms (0.062) |
 
-Detections are identical to standalone NAPA's (every ID and corner, to six decimals); the wrapper
-costs 3–9%. Packed YUYV (`BENCH_YUYV=1`) costs a further 10–60 µs a frame, copying out the luma.
+Detections are identical to standalone NAPA's (every ID and corner, to six decimals). Timed in the
+same loop as standalone NAPA (load a frame, detect it repeatedly), the Rust wrapper costs nothing
+measurable (within ±2%); the gap above comes from `bench.rs` drawing each frame between detects,
+which leaves the detector's buffers out of cache. Packed YUYV (`BENCH_YUYV=1`) costs a further 10–60 µs a frame, copying out the luma.
 `examples/bench.rs` prints a checksum of every detection, to confirm a change alters nothing, and
 `BENCH_DETECTIONS=file` writes them out for comparing against other detectors.
 

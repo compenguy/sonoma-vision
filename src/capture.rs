@@ -36,7 +36,9 @@ pub enum Layout {
 }
 
 impl Layout {
-    pub const ALL: [Layout; 5] = [Layout::Grey, Layout::Yuyv, Layout::Uyvy, Layout::Nv12, Layout::Mjpeg];
+    /// Every layout, in order of preference: the detector reads GREY and NV12 luma as is, copies YUYV
+    /// and UYVY luma out of its 2-byte pitch, and decodes MJPEG.
+    pub const ALL: [Layout; 5] = [Layout::Grey, Layout::Nv12, Layout::Yuyv, Layout::Uyvy, Layout::Mjpeg];
 
     pub fn fourcc(self) -> &'static [u8; 4] {
         match self {
@@ -75,7 +77,8 @@ pub struct CameraConfig {
     pub width: u32,
     pub height: u32,
     pub fps: Option<u32>,
-    /// None: the first of GREY, YUYV, UYVY, NV12, MJPG that the camera offers.
+    /// None: the first of GREY, NV12, YUYV, UYVY, MJPG that the camera offers at this size and frame
+    /// rate (or, if it offers none at them, the first it offers at all).
     pub layout: Option<Layout>,
     /// Driver buffers; fewer means less queued latency, but at least 2 keep the camera streaming.
     pub buffers: u32,
@@ -187,10 +190,7 @@ impl Camera {
         let layout = match cfg.layout {
             Some(l) if offered.contains(&l) => l,
             Some(l) => bail!("camera doesn't offer {:?}; it offers {offered:?}", l),
-            None => *Layout::ALL
-                .iter()
-                .find(|l| offered.contains(l))
-                .ok_or_else(|| anyhow!("camera offers none of {:?}", Layout::ALL))?,
+            None => choose_layout(&fd, &offered, cfg)?,
         };
         let want = Format {
             width: cfg.width,
@@ -376,6 +376,114 @@ impl Drop for Camera {
     }
 }
 
+/// The most preferred offered layout that the camera lists at the configured size and frame rate. A
+/// driver that doesn't list its modes is taken at its word; if none fits, the most preferred offered
+/// layout, whose size or rate the driver will adjust.
+fn choose_layout(fd: &File, offered: &[Layout], cfg: &CameraConfig) -> Result<Layout> {
+    let chosen = pick_layout(offered, |l| mode_fits(fd, l, cfg.width, cfg.height, cfg.fps))
+        .ok_or_else(|| anyhow!("camera offers none of {:?}", Layout::ALL))?;
+    if !chosen.1 {
+        warn!("no format offers {}x{} at the requested rate; using {:?}", cfg.width, cfg.height, chosen.0);
+    }
+    Ok(chosen.0)
+}
+
+/// [`choose_layout`]'s choice, given whether each layout fits: the layout, and whether it fits.
+fn pick_layout(offered: &[Layout], fits: impl Fn(Layout) -> Result<(), String>) -> Option<(Layout, bool)> {
+    let mut candidates = Layout::ALL.into_iter().filter(|l| offered.contains(l)).peekable();
+    let first = *candidates.peek()?;
+    for l in candidates {
+        match fits(l) {
+            Ok(()) => return Some((l, true)),
+            Err(why) => info!("not using {l:?}: {why}"),
+        }
+    }
+    Some((first, false))
+}
+
+/// Whether the camera lists `layout` at `width`x`height` (and `fps`, if given); Err says why not.
+fn mode_fits(fd: &File, layout: Layout, width: u32, height: u32, fps: Option<u32>) -> Result<(), String> {
+    let pf = PixelFormat::from(layout.fourcc());
+    let sizes: Vec<SizeRange> = (0..)
+        .map_while(|i| ioctl::enum_frame_sizes::<bindings::v4l2_frmsizeenum>(fd, i, pf).ok())
+        .filter_map(|e| SizeRange::from_enum(&e))
+        .collect();
+    if sizes.is_empty() {
+        return Ok(()); // not listed: unknown
+    }
+    if !sizes.iter().any(|r| r.contains(width, height)) {
+        return Err(format!("not offered at {width}x{height}"));
+    }
+    let Some(fps) = fps else { return Ok(()) };
+    let rates: Vec<RateRange> = (0..)
+        .map_while(|i| ioctl::enum_frame_intervals::<bindings::v4l2_frmivalenum>(fd, i, pf, width, height).ok())
+        .filter_map(|e| RateRange::from_enum(&e))
+        .collect();
+    if rates.is_empty() || rates.iter().any(|r| r.reaches(fps)) {
+        Ok(())
+    } else {
+        let best = rates.iter().map(RateRange::max_fps).fold(0.0, f64::max);
+        Err(format!("at most {best:.1} fps at {width}x{height}, not {fps}"))
+    }
+}
+
+/// Frame sizes a format is listed at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SizeRange {
+    Discrete(u32, u32),
+    /// min, max and step of width, then of height.
+    Steps([u32; 3], [u32; 3]),
+}
+
+impl SizeRange {
+    fn from_enum(e: &bindings::v4l2_frmsizeenum) -> Option<Self> {
+        use v4l2r::ioctl::FrmSizeTypes;
+        Some(match e.size()? {
+            FrmSizeTypes::Discrete(d) => Self::Discrete(d.width, d.height),
+            FrmSizeTypes::StepWise(s) => {
+                Self::Steps([s.min_width, s.max_width, s.step_width], [s.min_height, s.max_height, s.step_height])
+            }
+        })
+    }
+
+    fn contains(&self, width: u32, height: u32) -> bool {
+        let within = |v: u32, [lo, hi, step]: [u32; 3]| (lo..=hi).contains(&v) && (v - lo).is_multiple_of(step.max(1));
+        match *self {
+            Self::Discrete(w, h) => (w, h) == (width, height),
+            Self::Steps(ws, hs) => within(width, ws) && within(height, hs),
+        }
+    }
+}
+
+/// Frame intervals a format is listed at, for one size: the shortest interval gives the highest rate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RateRange {
+    /// An interval of numerator/denominator seconds.
+    Discrete(u32, u32),
+    /// The shortest interval of a range, numerator/denominator seconds.
+    Shortest(u32, u32),
+}
+
+impl RateRange {
+    fn from_enum(e: &bindings::v4l2_frmivalenum) -> Option<Self> {
+        use v4l2r::ioctl::FrmIvalTypes;
+        Some(match e.intervals()? {
+            FrmIvalTypes::Discrete(f) => Self::Discrete(f.numerator, f.denominator),
+            FrmIvalTypes::StepWise(s) => Self::Shortest(s.min.numerator, s.min.denominator),
+        })
+    }
+
+    fn max_fps(&self) -> f64 {
+        let (Self::Discrete(n, d) | Self::Shortest(n, d)) = *self;
+        if n == 0 { 0.0 } else { f64::from(d) / f64::from(n) }
+    }
+
+    /// Whether this offers `fps` or faster (within 1%: 30000/1001 counts as 30).
+    fn reaches(&self, fps: u32) -> bool {
+        self.max_fps() >= 0.99 * f64::from(fps)
+    }
+}
+
 fn set_fps(fd: &File, fps: u32) -> Option<f64> {
     let mut parm = v4l2_streamparm { type_: QUEUE as u32, ..Default::default() };
     // Writing a Copy union field is safe; `capture` is the active member for a capture queue.
@@ -390,5 +498,51 @@ fn set_fps(fd: &File, fps: u32) -> Option<f64> {
             warn!("couldn't set {fps} fps: {e}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefers_formats_the_detector_reads_in_place() {
+        let all_fit = |_| Ok(());
+        assert_eq!(pick_layout(&[Layout::Mjpeg, Layout::Yuyv, Layout::Nv12], all_fit), Some((Layout::Nv12, true)));
+        assert_eq!(pick_layout(&[Layout::Mjpeg, Layout::Yuyv], all_fit), Some((Layout::Yuyv, true)));
+        assert_eq!(pick_layout(&[], all_fit), None);
+    }
+
+    #[test]
+    fn skips_formats_without_the_mode() {
+        // A typical UVC camera: NV12 and YUYV only at low rates for this size, MJPEG at full rate.
+        let fits = |l| if l == Layout::Mjpeg { Ok(()) } else { Err("too slow".to_string()) };
+        let offered = [Layout::Yuyv, Layout::Nv12, Layout::Mjpeg];
+        assert_eq!(pick_layout(&offered, fits), Some((Layout::Mjpeg, true)));
+        // Nothing fits: the most preferred, for the driver to adjust.
+        assert_eq!(pick_layout(&offered, |_| Err(String::new())), Some((Layout::Nv12, false)));
+    }
+
+    #[test]
+    fn size_ranges() {
+        assert!(SizeRange::Discrete(1280, 720).contains(1280, 720));
+        assert!(!SizeRange::Discrete(1280, 720).contains(1920, 1080));
+        let steps = SizeRange::Steps([16, 1920, 16], [16, 1080, 8]);
+        assert!(steps.contains(1280, 720));
+        assert!(!steps.contains(1288, 720), "off the width step");
+        assert!(!steps.contains(1280, 1088), "over the height range");
+        // Continuous ranges report a step of 1 (or 0 from a sloppy driver).
+        assert!(SizeRange::Steps([1, 4000, 0], [1, 3000, 0]).contains(1281, 721));
+    }
+
+    #[test]
+    fn rate_ranges() {
+        assert!(RateRange::Discrete(1, 60).reaches(60));
+        assert!(RateRange::Discrete(1, 60).reaches(30));
+        assert!(!RateRange::Discrete(1, 30).reaches(60));
+        assert!(RateRange::Discrete(1001, 30000).reaches(30), "NTSC 29.97 counts as 30");
+        assert!(RateRange::Shortest(1, 90).reaches(60));
+        assert!(!RateRange::Discrete(0, 0).reaches(1));
+        assert_eq!(RateRange::Discrete(1, 5).max_fps(), 5.0);
     }
 }
