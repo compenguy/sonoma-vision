@@ -295,8 +295,9 @@ sudo systemctl daemon-reload && sudo systemctl enable --now sonoma-vision@cam0
 
 ```sh
 cargo test                                       # unit tests, synthetic accuracy, NT4 and stream end to end
-cargo run --release --example bench -- 50        # recall, corner error and latency per scenario
-cargo run --release --example camera -- /dev/video0 640 480   # live capture and detection
+cargo run --release --example bench -- --frames 50           # recall, corner error and latency per scenario
+cargo run --release --example camera -- --device /dev/video0  # live capture and detection
+cargo run --release --example list_modes -- /dev/video0       # a camera's formats, sizes and rates
 ```
 
 `tests/nt_publish.rs` runs the publisher against a minimal in-process NT4 server, and checks that the
@@ -304,7 +305,7 @@ capture timestamps survive time sync; `tests/nt_settings.rs` checks live setting
 persisted values.
 
 Synthetic benchmark (`examples/bench.rs`, 40 frames per scenario, each detected 5 times on one pinned
-desktop core, `BENCH_REPEAT=5 taskset -c 2`), with napa-vision built standalone by its own CMake and
+desktop core, `taskset -c 2 … bench -- --frames 40 --repeat 5`), with napa-vision built standalone by its own CMake and
 timed the same way on the same frames:
 
 | Scenario | Recall | Wrong IDs | Median / p95 corner error | Median time (standalone NAPA) |
@@ -320,9 +321,9 @@ timed the same way on the same frames:
 Detections are identical to standalone NAPA's (every ID and corner, to six decimals). Timed in the
 same loop as standalone NAPA (load a frame, detect it repeatedly), the Rust wrapper costs nothing
 measurable (within ±2%); the gap above comes from `bench.rs` drawing each frame between detects,
-which leaves the detector's buffers out of cache. Packed YUYV (`BENCH_YUYV=1`) costs a further 10–60 µs a frame, copying out the luma.
+which leaves the detector's buffers out of cache. Packed YUYV (`--yuyv`) costs a further 10–60 µs a frame, copying out the luma.
 `examples/bench.rs` prints a checksum of every detection, to confirm a change alters nothing, and
-`BENCH_DETECTIONS=file` writes them out for comparing against other detectors.
+`--detections <file>` writes them out for comparing against other detectors.
 
 ## Regenerating the tag families
 

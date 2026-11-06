@@ -1,17 +1,16 @@
 //! Synthetic benchmark: recall, wrong IDs, corner error and latency per scenario.
 //!
-//!     cargo run --release --example bench [frames] [pgm-dir]
+//!     cargo run --release --example bench -- [--frames N] [--repeat K] [--pgm-dir DIR]
+//!         [--detections FILE] [--yuyv]
 //!
-//! With `pgm-dir`, every frame is also written there as PGM (with a `truth.txt`), for comparing other
-//! detectors on the same frames. `BENCH_REPEAT=k` detects each frame k times (timing each), so a
-//! profile is of the detector rather than of drawing frames. The last line is a checksum of every
-//! detection (IDs and corners' exact bits), to confirm an optimisation changes nothing.
-//! `BENCH_DETECTIONS=file` writes every detection (`frame id x0 y0 ... x3 y3`), with `pgm-dir`'s
-//! frame names, for comparing against other detectors. `BENCH_YUYV=1` hands frames over as packed YUYV
-//! (luma at every other byte).
+//! The last line is a checksum of every detection (IDs and corners' exact bits), to confirm an
+//! optimisation changes nothing. `--help` describes each option.
 
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::time::Instant;
+
+use clap::Parser;
 
 use sonoma_vision::detector::{Config, Detector, ImageView, families};
 use sonoma_vision::synth::{Canvas, Rng, TruthTag, random_quad, write_pgm};
@@ -150,13 +149,33 @@ fn render(rng: &mut Rng, sc: &Scenario) -> (Vec<u8>, Vec<TruthTag>) {
     (canvas.to_gray(), truth)
 }
 
+/// Synthetic benchmark: recall, wrong IDs, corner error and latency per scenario.
+#[derive(Parser)]
+struct Args {
+    /// Frames per scenario.
+    #[arg(long, default_value_t = 50)]
+    frames: usize,
+    /// Detect each frame this many times, timing each, so a profile is of the detector rather than of
+    /// drawing frames.
+    #[arg(long, default_value_t = 1)]
+    repeat: usize,
+    /// Also write every frame to this directory as PGM, with a truth.txt, for comparing other
+    /// detectors on the same frames.
+    #[arg(long, value_name = "DIR")]
+    pgm_dir: Option<PathBuf>,
+    /// Write every detection to this file (`frame id x0 y0 ... x3 y3`, with --pgm-dir's frame names),
+    /// for comparing against other detectors.
+    #[arg(long, value_name = "FILE")]
+    detections: Option<PathBuf>,
+    /// Hand frames over as packed YUYV (luma at every other byte).
+    #[arg(long)]
+    yuyv: bool,
+}
+
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let frames: usize = args.next().map_or(50, |a| a.parse().expect("frames"));
-    let dump = args.next().map(std::path::PathBuf::from);
-    let mut detections_txt = std::env::var_os("BENCH_DETECTIONS").map(|p| (p, String::new()));
-    let repeat: usize = std::env::var("BENCH_REPEAT").map_or(1, |r| r.parse().expect("BENCH_REPEAT"));
-    let yuyv = std::env::var_os("BENCH_YUYV").is_some();
+    let args = Args::parse();
+    let (frames, repeat, yuyv, dump) = (args.frames, args.repeat, args.yuyv, args.pgm_dir);
+    let mut detections_txt = args.detections.map(|p| (p, String::new()));
     let mut det = Detector::new(&families::TAG36H11, &Config::default()).unwrap();
     let mut packed = Vec::new();
     let mut truth_txt = String::new();

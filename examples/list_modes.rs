@@ -1,14 +1,25 @@
 //! List a camera's pixel formats, frame sizes and frame rates, as the format choice sees them.
 //!
-//!     cargo run --release --example list_modes -- /dev/video0
+//!     cargo run --release --example list_modes -- [DEVICE]
 
+use std::path::PathBuf;
+
+use clap::Parser;
 use sonoma_vision::capture::{RateRange, SizeRange, frame_rates, frame_sizes};
 use v4l2r::QueueType;
 use v4l2r::ioctl::FormatIterator;
 
+/// List a camera's pixel formats, frame sizes and frame rates.
+#[derive(Parser)]
+struct Args {
+    /// V4L2 capture device.
+    #[arg(default_value = "/dev/video0")]
+    device: PathBuf,
+}
+
 fn main() -> anyhow::Result<()> {
-    let dev = std::env::args().nth(1).unwrap_or_else(|| "/dev/video0".into());
-    let fd = std::fs::OpenOptions::new().read(true).write(true).open(&dev)?;
+    let args = Args::parse();
+    let fd = std::fs::OpenOptions::new().read(true).write(true).open(&args.device)?;
     for f in FormatIterator::new(&fd, QueueType::VideoCapture) {
         println!("{} ({})", f.pixelformat, f.description);
         for size in frame_sizes(&fd, f.pixelformat) {
