@@ -145,6 +145,24 @@ pub struct Camera {
     pub stride: usize,
     pub layout: Layout,
     pub fps: Option<f64>,
+    /// Whether the first frame's timestamp semantics have been logged.
+    reported_timestamps: bool,
+}
+
+/// What a buffer's timestamp means, from its flags: the clock, and the moment of the frame it marks.
+pub fn describe_timestamp(flags: u32) -> (&'static str, &'static str) {
+    let clock = match flags & bindings::V4L2_BUF_FLAG_TIMESTAMP_MASK {
+        bindings::V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC => "CLOCK_MONOTONIC",
+        bindings::V4L2_BUF_FLAG_TIMESTAMP_COPY => "copied from the application (not a capture time)",
+        _ => "unknown",
+    };
+    // End of frame is 0 within the mask, so compare the masked bits rather than test for a flag.
+    let source = match flags & bindings::V4L2_BUF_FLAG_TSTAMP_SRC_MASK {
+        bindings::V4L2_BUF_FLAG_TSTAMP_SRC_SOE => "start of exposure",
+        bindings::V4L2_BUF_FLAG_TSTAMP_SRC_EOF => "end of frame",
+        _ => "unknown",
+    };
+    (clock, source)
 }
 
 const QUEUE: QueueType = QueueType::VideoCapture;
@@ -217,6 +235,7 @@ impl Camera {
             stride,
             layout,
             fps,
+            reported_timestamps: false,
         };
         for i in 0..count {
             cam.queue(i as u32)?;
@@ -324,6 +343,15 @@ impl Camera {
         let used = *buf.get_first_plane().bytesused as usize;
         let mapping = &self.mappings[index as usize];
         let data = &mapping.as_ref()[..used.min(mapping.len())];
+        if !self.reported_timestamps {
+            self.reported_timestamps = true;
+            let flags = buf.flags().bits();
+            let (clock, source) = describe_timestamp(flags);
+            info!("frame timestamps: {clock}, {source} (buffer flags {flags:#x})");
+            if flags & bindings::V4L2_BUF_FLAG_TIMESTAMP_MASK != bindings::V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC {
+                warn!("frame timestamps are not on CLOCK_MONOTONIC: published capture times will be wrong");
+            }
+        }
         let tv = buf.timestamp();
         let timestamp = Duration::new(tv.tv_sec as u64, tv.tv_usec as u32 * 1000);
         if self.layout.zero_copy() && data.len() < self.stride * (self.height - 1) + self.width {
