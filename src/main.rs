@@ -1,5 +1,6 @@
 //! sonoma-vision: capture frames from a V4L2 camera, detect AprilTags, publish them over NT4.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,12 +9,16 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Parser;
 use log::{error, info, warn};
+use nalgebra::{Isometry3, Translation3, UnitQuaternion};
 use tokio::sync::watch;
 
 use sonoma_vision::capture::{Camera, CameraConfig, Layout};
 use sonoma_vision::detector::{Config, Detector, Family};
 use sonoma_vision::nt::{self, CameraAdvert, FrameResult, NtConfig};
-use sonoma_vision::settings::Settings;
+use sonoma_vision::pose::camera::Intrinsics;
+use sonoma_vision::pose::field::{self, FieldLayout};
+use sonoma_vision::pose::{Estimator, FRC_TAG_SIZE, PoseConfig};
+use sonoma_vision::settings::{NO_LAYOUT, Settings};
 use sonoma_vision::stream::{self, StreamConfig, Tap};
 
 #[derive(Parser, Debug)]
@@ -98,6 +103,44 @@ struct Args {
     /// Camera name dashboards show (default: sonoma- and the table's last part, e.g. sonoma-cam0).
     #[arg(long)]
     stream_name: Option<String>,
+
+    /// PhotonVision calibration JSON for this camera (any resolution of the same aspect ratio). Without
+    /// one, the camera is approximated from --fov, which is fine for trying things but not for
+    /// accurate poses.
+    #[arg(long, env = "SONOMA_CALIBRATION")]
+    calibration: Option<PathBuf>,
+    /// Diagonal field of view in degrees, for the approximation used without --calibration.
+    #[arg(long, default_value_t = 70.0)]
+    fov: f64,
+    /// Side of the tag's black square, in metres (FRC: 6.5 in).
+    #[arg(long, default_value_t = FRC_TAG_SIZE)]
+    tag_size: f64,
+    /// Field layout for poses: the name of a layout in a `fields` directory (searched in
+    /// /usr/share/sonoma-vision, /usr/local/share/sonoma-vision, the working directory, then beside
+    /// the executable), a WPILib layout JSON file, or `none` for no poses. Without it,
+    /// 2026-rebuilt-welded if it's found, else none. A selection persisted in NT wins over this.
+    #[arg(long, env = "SONOMA_FIELD_LAYOUT")]
+    field_layout: Option<String>,
+    /// The camera's pose on the robot, WPILib's robot-to-camera transform: x,y,z in metres (forward,
+    /// left, up from the robot's origin), then roll,pitch,yaw in degrees.
+    #[arg(long, default_value = "0,0,0,0,0,0", value_parser = parse_transform, allow_hyphen_values = true)]
+    robot_to_camera: Isometry3<f64>,
+    /// Single-tag robot poses more ambiguous than this (0-1) aren't published.
+    #[arg(long, default_value_t = 0.2)]
+    max_ambiguity: f64,
+}
+
+/// `x,y,z,roll,pitch,yaw` (metres, degrees) as a transform.
+fn parse_transform(s: &str) -> Result<Isometry3<f64>, String> {
+    let v: Vec<f64> =
+        s.split(',').map(|p| p.trim().parse::<f64>()).collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+    let [x, y, z, roll, pitch, yaw] = v[..] else {
+        return Err(format!("expected x,y,z,roll,pitch,yaw (6 numbers), got {}", v.len()));
+    };
+    Ok(Isometry3::from_parts(
+        Translation3::new(x, y, z),
+        UnitQuaternion::from_euler_angles(roll.to_radians(), pitch.to_radians(), yaw.to_radians()),
+    ))
 }
 
 fn main() -> Result<()> {
@@ -122,8 +165,30 @@ fn main() -> Result<()> {
         min_contrast: args.min_contrast,
         stream_auto_levels: args.stream_auto_levels,
         stream_gamma: args.stream_gamma,
+        field_layout: None,
     };
+    let (layouts, field_layout) = field_layouts(args.field_layout.as_deref())?;
+    let settings = Settings { field_layout, ..settings };
     let (settings_tx, settings_rx) = watch::channel(settings);
+    let pose = PoseConfig {
+        calibration: match &args.calibration {
+            Some(path) => {
+                let json = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+                Some(Intrinsics::from_photonvision(&json).with_context(|| format!("calibration {}", path.display()))?)
+            }
+            None => None,
+        },
+        fov_deg: args.fov,
+        tag_size: args.tag_size,
+        // Chosen live, from `layouts`.
+        layout: None,
+        robot_to_camera: args.robot_to_camera,
+        max_ambiguity: args.max_ambiguity,
+    };
+    anyhow::ensure!(args.tag_size > 0.0, "--tag-size must be positive");
+    if pose.calibration.is_none() {
+        warn!("no --calibration: approximating the camera from a {}° field of view; poses are rough", args.fov);
+    }
     let camera = CameraConfig {
         device: args.device.clone(),
         width: args.width,
@@ -165,6 +230,7 @@ fn main() -> Result<()> {
         client_name: args.nt_name,
         table: args.table,
         camera: camera_advert,
+        field_layouts: layouts.keys().cloned().collect(),
     };
 
     let (tx, rx) = watch::channel(None);
@@ -173,7 +239,7 @@ fn main() -> Result<()> {
         let stop = stop.clone();
         std::thread::Builder::new()
             .name("vision".into())
-            .spawn(move || vision_loop(camera, family, config, settings_rx, tx, tap, &stop))?
+            .spawn(move || vision_loop(Setup { camera, family, config, pose, layouts }, settings_rx, tx, tap, &stop))?
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?;
@@ -200,15 +266,102 @@ fn main() -> Result<()> {
 
 /// Capture and detect until `stop`, reopening the camera after errors (e.g. a USB unplug), and apply
 /// live settings as they change.
-fn vision_loop(
-    cfg: CameraConfig,
+/// What the vision thread works with, fixed at startup.
+struct Setup {
+    camera: CameraConfig,
     family: &'static Family,
-    mut config: Config,
+    config: Config,
+    pose: PoseConfig,
+    /// The field layouts that can be selected, by name.
+    layouts: BTreeMap<String, FieldLayout>,
+}
+
+/// The default layout, when it's found.
+const DEFAULT_LAYOUT: &str = "2026-rebuilt-welded";
+
+/// The layouts that can be selected (those in the `fields` directories, and `spec` if it's a file),
+/// and which to start with: `spec`'s, or without one, [`DEFAULT_LAYOUT`] if it's there.
+fn field_layouts(spec: Option<&str>) -> Result<(BTreeMap<String, FieldLayout>, Option<String>)> {
+    let catalog = field::Catalog::discover();
+    for (name, (_, path)) in &catalog.layouts {
+        info!("field layout {name}: {}", path.display());
+    }
+    let mut layouts: BTreeMap<String, FieldLayout> =
+        catalog.layouts.into_iter().map(|(name, (layout, _))| (name, layout)).collect();
+    let selected = match spec {
+        Some(NO_LAYOUT) => None,
+        Some(spec) if layouts.contains_key(spec) => Some(spec.to_string()),
+        Some(spec) => {
+            let path = std::path::Path::new(spec);
+            anyhow::ensure!(
+                path.is_file(),
+                "--field-layout {spec:?} is neither a file nor a layout found in {} (found: {})",
+                catalog.dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", "),
+                if layouts.is_empty() { "none".into() } else { layouts.keys().cloned().collect::<Vec<_>>().join(", ") },
+            );
+            layouts.insert(spec.to_string(), FieldLayout::from_file(path)?);
+            Some(spec.to_string())
+        }
+        None if layouts.contains_key(DEFAULT_LAYOUT) => Some(DEFAULT_LAYOUT.to_string()),
+        None => {
+            warn!("field layout {DEFAULT_LAYOUT} not found; no poses until a layout is selected");
+            None
+        }
+    };
+    if layouts.is_empty() {
+        warn!(
+            "no field layouts found in {}: poses are off",
+            catalog.dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok((layouts, selected))
+}
+
+/// An estimator for `width` × `height` frames against the layout `name`; None (no pose solving) with
+/// no layout.
+fn build_estimator(
+    pose: &PoseConfig,
+    layouts: &BTreeMap<String, FieldLayout>,
+    name: Option<&str>,
+    width: usize,
+    height: usize,
+) -> Option<Estimator> {
+    let Some(name) = name else {
+        info!("no field layout: poses off");
+        return None;
+    };
+    let Some(layout) = layouts.get(name) else {
+        warn!("no field layout {name:?}: poses off");
+        return None;
+    };
+    match Estimator::new(&PoseConfig { layout: Some(layout.clone()), ..pose.clone() }, width, height) {
+        Ok(e) => {
+            let c = &e.camera;
+            info!(
+                "poses against {name} ({} tags); camera model: fx {:.1} fy {:.1} cx {:.1} cy {:.1}",
+                layout.tags.len(),
+                c.fx,
+                c.fy,
+                c.cx,
+                c.cy
+            );
+            Some(e)
+        }
+        Err(e) => {
+            error!("no poses: {e:#}");
+            None
+        }
+    }
+}
+
+fn vision_loop(
+    setup: Setup,
     mut settings: watch::Receiver<Settings>,
     tx: watch::Sender<Option<Arc<FrameResult>>>,
     mut tap: Option<Tap>,
     stop: &AtomicBool,
 ) {
+    let Setup { camera: cfg, family, mut config, pose, layouts } = setup;
     let mut detector = Detector::new(family, &config).expect("checked at startup");
     let mut scratch = Vec::new();
     let mut detections = Vec::new();
@@ -223,7 +376,9 @@ fn vision_loop(
             }
         };
         // A newly opened camera gets every control; after that, only changes.
-        let mut applied = None;
+        let mut applied: Option<Settings> = None;
+        // Built with the settings below, and rebuilt when the field layout changes.
+        let mut estimator = None;
         if !camera.layout.zero_copy() {
             warn!("{:?} frames are decoded (one copy per frame); a raw format avoids it", camera.layout);
         }
@@ -234,6 +389,10 @@ fn vision_loop(
             if applied.is_none() || settings.has_changed().unwrap_or(false) {
                 let new = settings.borrow_and_update().clone();
                 apply_settings(&camera, &mut detector, &mut config, applied.as_ref(), &new);
+                if applied.as_ref().is_none_or(|old| old.field_layout != new.field_layout) {
+                    let name = new.field_layout.as_deref();
+                    estimator = build_estimator(&pose, &layouts, name, camera.width, camera.height);
+                }
                 applied = Some(new);
             }
             let frame = match camera.next_frame(Duration::from_millis(500)) {
@@ -266,6 +425,15 @@ fn vision_loop(
                 fps = if fps == 0.0 { 1.0 / dt } else { 0.9 * fps + 0.1 / dt };
             }
             last_frame = Some(t0);
+            // With no field layout, no pose solving at all.
+            let (tag_poses, field_pose) = match &estimator {
+                Some(e) => {
+                    let tags: Vec<_> = detections.iter().map(|d| e.tag(d)).collect();
+                    let field = e.field(&detections, &tags);
+                    (tags, field)
+                }
+                None => (vec![None; detections.len()], None),
+            };
             let result = FrameResult {
                 sequence: frame.sequence,
                 capture: frame.timestamp,
@@ -273,6 +441,8 @@ fn vision_loop(
                 detect_time,
                 fps,
                 dropped,
+                tag_poses,
+                field_pose,
             };
             // Only the publisher holds a receiver; if it's gone, the service is shutting down.
             if tx.send(Some(Arc::new(result))).is_err() {

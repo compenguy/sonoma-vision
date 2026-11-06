@@ -6,10 +6,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
+use nalgebra::{Isometry3, Translation3, UnitQuaternion};
 use rmpv::Value;
 use sonoma_vision::clock::monotonic_now;
 use sonoma_vision::detector::Detection;
 use sonoma_vision::nt::{self, CameraAdvert, FrameResult, NtConfig};
+use sonoma_vision::pose::{FieldPose, TagPose};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
@@ -35,6 +37,7 @@ async fn fake_server(listener: TcpListener, values: mpsc::UnboundedSender<(Strin
     let start = Instant::now();
     let now = || SERVER_EPOCH_US + start.elapsed().as_micros() as u64;
     let mut topics: HashMap<i64, String> = HashMap::new();
+    let mut announced = std::collections::HashSet::new();
     while let Some(Ok(msg)) = rx.next().await {
         match msg {
             Message::Text(text) => {
@@ -43,8 +46,13 @@ async fn fake_server(listener: TcpListener, values: mpsc::UnboundedSender<(Strin
                     if m["method"] == "publish" {
                         let p = &m["params"];
                         let pubuid = p["pubuid"].as_i64().unwrap();
-                        topics.insert(pubuid, p["name"].as_str().unwrap().to_string());
-                        // Announce it back to its publisher, as a real server does (topic id = pubuid).
+                        let name = p["name"].as_str().unwrap().to_string();
+                        topics.insert(pubuid, name.clone());
+                        // Announce it back to its publisher (topic id = pubuid), only once per topic as
+                        // WPILib's server does: publishing a topic again gets no second announcement.
+                        if !announced.insert(name) {
+                            continue;
+                        }
                         let announce = serde_json::json!([{"method": "announce", "params": {
                             "name": p["name"], "id": pubuid, "type": p["type"], "pubuid": pubuid, "properties": {},
                         }}]);
@@ -93,6 +101,7 @@ async fn publishes_frames_with_server_capture_time() {
             source: "usb:/dev/video9".into(),
             mode: "320x240 MJPEG 15 fps".into(),
         }),
+        field_layouts: vec![],
     };
     let (settings, _) = watch::channel(sonoma_vision::settings::Settings::default());
     let client = tokio::spawn(nt::run(cfg, rx, settings));
@@ -108,6 +117,25 @@ async fn publishes_frames_with_server_capture_time() {
     let mut seq = 0;
     let mut camera = HashMap::new();
     let mut tag = HashMap::new();
+    let mut pose = HashMap::new();
+    // The tag 2 m ahead and 0.5 m left, facing the camera; the robot at (1, 2) facing +Y.
+    let camera_to_tag = Isometry3::from_parts(
+        Translation3::new(2.0, 0.5, 0.0),
+        UnitQuaternion::from_euler_angles(0.0, 0.0, std::f64::consts::PI),
+    );
+    let robot = Isometry3::from_parts(
+        Translation3::new(1.0, 2.0, 0.0),
+        UnitQuaternion::from_euler_angles(0.0, 0.0, std::f64::consts::FRAC_PI_2),
+    );
+    let tag_pose = TagPose { camera_to_tag, alternate: None, error_px: 0.1, ambiguity: 0.05 };
+    let field_pose = FieldPose { robot, camera: robot, tags: vec![3], error_px: 0.1, ambiguity: 0.05 };
+    let record_pose = |pose: &mut HashMap<String, Value>, name: &str, v: &Value| {
+        if let Some(key) = name.strip_prefix("/sonoma/test/")
+            && ["robot_pose", "pose_tags", "field/.type", "field/Robot"].contains(&key)
+        {
+            pose.insert(key.to_string(), v.clone());
+        }
+    };
     let (server_rx_time, record) = loop {
         assert!(Instant::now() < deadline, "no frame record arrived");
         seq += 1;
@@ -115,6 +143,8 @@ async fn publishes_frames_with_server_capture_time() {
             sequence: seq,
             capture: monotonic_now() - Duration::from_millis(20),
             detections: vec![det],
+            tag_poses: vec![Some(tag_pose)],
+            field_pose: Some(field_pose.clone()),
             ..Default::default()
         };
         tx.send(Some(Arc::new(result))).unwrap();
@@ -127,6 +157,8 @@ async fn publishes_frames_with_server_capture_time() {
                     camera.insert(key.to_string(), v);
                 } else if let Some(key) = name.strip_prefix("/sonoma/test/tags/3/") {
                     tag.insert(key.to_string(), v);
+                } else {
+                    record_pose(&mut pose, &name, &v);
                 }
             }
             None
@@ -154,23 +186,56 @@ async fn publishes_frames_with_server_capture_time() {
     assert_eq!(&record[4..], &[3.0, 0.0, 80.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
 
     // Each tag ID gets its own named topics.
-    let keys = ["center_x", "center_y", "corners", "hamming", "margin", "visible"];
+    let keys = [
+        "ambiguity",
+        "bearing",
+        "camera_to_tag",
+        "center_x",
+        "center_y",
+        "corners",
+        "distance",
+        "hamming",
+        "margin",
+        "visible",
+    ];
+    let pose_keys = ["robot_pose", "pose_tags", "field/.type", "field/Robot"];
     let collect = async {
-        while !keys.iter().all(|k| tag.contains_key(*k)) {
+        while !keys.iter().all(|k| tag.contains_key(*k)) || !pose_keys.iter().all(|k| pose.contains_key(*k)) {
             let (name, _, _, v) = vrx.recv().await.unwrap();
             if let Some(key) = name.strip_prefix("/sonoma/test/tags/3/") {
                 tag.insert(key.to_string(), v);
+            } else {
+                record_pose(&mut pose, &name, &v);
             }
         }
     };
     let got = tokio::time::timeout(Duration::from_secs(5), collect).await;
-    assert!(got.is_ok(), "per-tag topics: got {tag:?}");
+    assert!(got.is_ok(), "per-tag and pose topics: got {tag:?} and {pose:?}");
     assert_eq!(tag["visible"], Value::from(true));
     assert_eq!(tag["margin"], Value::from(80.0));
     assert_eq!(tag["hamming"], Value::from(0));
     assert_eq!((tag["center_x"].as_f64(), tag["center_y"].as_f64()), (Some(4.0), Some(5.0)));
     let corners: Vec<f64> = tag["corners"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
     assert_eq!(corners, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    // 2 m ahead and 0.5 m left: 2.06 m away, 14.0° to the left.
+    assert_eq!(tag["distance"], Value::from(2.06));
+    assert_eq!(tag["bearing"], Value::from(14.0));
+    assert_eq!(tag["ambiguity"], Value::from(0.05));
+
+    // The robot's pose: a WPILib Pose3d struct (x, y, z, then quaternion w, x, y, z, as little-endian
+    // doubles), and a Field2d for dashboards.
+    let bytes = match &pose["robot_pose"] {
+        Value::Binary(b) => b.clone(),
+        other => panic!("robot_pose is {other:?}"),
+    };
+    let doubles: Vec<f64> = bytes.chunks(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+    let half = std::f64::consts::FRAC_1_SQRT_2;
+    let expected = [1.0, 2.0, 0.0, half, 0.0, 0.0, half];
+    assert!(doubles.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-12), "{doubles:?}");
+    assert_eq!(pose["pose_tags"], Value::Array(vec![Value::from(3)]));
+    assert_eq!(pose["field/.type"], Value::from("Field2d"));
+    let robot2d: Vec<f64> = pose["field/Robot"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+    assert!((robot2d[0] - 1.0).abs() < 1e-12 && (robot2d[1] - 2.0).abs() < 1e-12 && (robot2d[2] - 90.0).abs() < 1e-9);
 
     // The camera stream is advertised as CameraServer does, before any frame, with every topic
     // Elastic needs to recognise a camera.

@@ -1,5 +1,5 @@
 //! Settings that can be changed while running, over NT (see [`crate::nt`]): camera exposure and gain,
-//! the detector's contrast threshold, and the stream's image adjustments.
+//! the detector's contrast threshold, the stream's image adjustments, and the field layout.
 
 use rmpv::Value;
 
@@ -15,11 +15,20 @@ pub struct Settings {
     pub stream_auto_levels: bool,
     /// Gamma applied to the stream: above 1 lifts shadows, below 1 deepens them.
     pub stream_gamma: f64,
+    /// The field layout poses are solved against, by name; None turns pose solving off.
+    pub field_layout: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { exposure: None, gain: None, min_contrast: 20, stream_auto_levels: true, stream_gamma: 1.0 }
+        Self {
+            exposure: None,
+            gain: None,
+            min_contrast: 20,
+            stream_auto_levels: true,
+            stream_gamma: 1.0,
+            field_layout: None,
+        }
     }
 }
 
@@ -98,7 +107,25 @@ impl Settings {
         }
         Ok(())
     }
+
+    /// Select the field layout `name`, one of `available`, or `none` (or empty) for no poses.
+    pub fn set_field_layout(&mut self, name: &str, available: &[String]) -> Result<(), String> {
+        self.field_layout = match name {
+            "" | NO_LAYOUT => None,
+            name if available.iter().any(|a| a == name) => Some(name.to_string()),
+            name => return Err(format!("no field layout {name:?}; one of {}, or {NO_LAYOUT}", available.join(", "))),
+        };
+        Ok(())
+    }
+
+    /// The field layout's name as published to NT: `none` for no layout.
+    pub fn field_layout_name(&self) -> &str {
+        self.field_layout.as_deref().unwrap_or(NO_LAYOUT)
+    }
 }
+
+/// The field layout name that turns pose solving off.
+pub const NO_LAYOUT: &str = "none";
 
 #[cfg(test)]
 mod tests {
@@ -125,6 +152,14 @@ mod tests {
         assert_eq!(s.stream_gamma, 2.0);
         assert!(s.set(Key::StreamGamma, &Value::from(0.0)).is_err());
         assert_eq!(s.min_contrast, 20, "rejected values leave the setting alone");
+        let available = vec!["a".to_string(), "b".to_string()];
+        s.set_field_layout("b", &available).unwrap();
+        assert_eq!(s.field_layout.as_deref(), Some("b"));
+        assert!(s.set_field_layout("c", &available).is_err());
+        assert_eq!(s.field_layout_name(), "b");
+        s.set_field_layout("none", &available).unwrap();
+        assert_eq!(s.field_layout, None);
+        assert_eq!(s.field_layout_name(), "none");
         for k in Key::ALL {
             assert_eq!(Key::from_name(k.name()), Some(k));
         }

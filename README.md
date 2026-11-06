@@ -18,8 +18,10 @@ resolution. See [NOTICE](NOTICE) for credits and licensing (GPL-3.0-only).
 | `src/nt.rs` | NT4 publishing via [nt_client](https://crates.io/crates/nt_client) (patched, `vendor/`) |
 | `src/stream.rs` | Optional MJPEG camera stream for dashboards, with tag overlays |
 | `src/settings.rs` | Settings that can be changed while running, over NT |
+| `src/pose/` | Pose solving: camera model, IPPE and refinement, field layouts |
 | `src/main.rs` | The service: a capture/detect thread feeding the NT publisher |
 | `src/synth.rs` | Synthetic frames with exact ground truth, for tests and benchmarks |
+| `fields/` | Field layouts (WPILib JSON), read at startup |
 | `deploy/` | systemd unit (one instance per camera) and an example config |
 | `vendor/apriltag/` | Upstream AprilTag family sources (unmodified), which the generator reads |
 | `tools/` | Family table generator, SystemCore cross-build script |
@@ -48,6 +50,13 @@ Under the table (default `/sonoma/cam0`):
 | `tags/<id>/margin`, `hamming` | double, int | How clearly it was read (see below) |
 | `tags/<id>/center_x`, `center_y` | double | Its centre, in pixels |
 | `tags/<id>/corners` | double[] | `[x0, y0, x1, y1, x2, y2, x3, y3]` |
+| `tags/<id>/distance`, `bearing` | double | Metres from the camera; degrees off its axis, left positive |
+| `tags/<id>/ambiguity` | double | How uncertain its orientation is (see Poses) |
+| `tags/<id>/camera_to_tag` | struct Transform3d | The tag's pose in the camera's frame |
+| `robot_pose` | struct Pose3d | The robot's pose on the field, timestamped with the capture time |
+| `pose_tags` | int[] | The tags `robot_pose` came from |
+| `pose_error_px`, `pose_ambiguity` | double | Its reprojection error, and ambiguity (single tag only) |
+| `field` | Field2d | The robot's pose for dashboards' field widgets |
 
 The `tags/<id>/` topics are for dashboards: a group per tag ID seen, rounded to one decimal so they're
 readable, kept when the tag leaves view (`visible` turns false). Robot code should read `frame`, the
@@ -55,10 +64,21 @@ one atomic record per frame.
 
 `frame` is one atomic record per frame. Its NT timestamp, and `capture_time_us`, are the capture time
 on the NT server's clock, the clock the robot program's own NT timestamps use. Corners are in
-pixel-centre coordinates, in napa-vision's (OpenCV's AprilTag) corner order. Pose solving is not implemented
-yet: robot code gets corners.
+pixel-centre coordinates, in napa-vision's (OpenCV's AprilTag) corner order: the printed tag's top-left,
+top-right, bottom-right, bottom-left.
 
-Reading it in robot code (Java):
+Reading the robot's pose in robot code (Java), for the drivetrain's pose estimator:
+
+```java
+StructSubscriber<Pose3d> poses = NetworkTableInstance.getDefault()
+    .getStructTopic("/sonoma/cam0/robot_pose", Pose3d.struct).subscribe(new Pose3d());
+
+for (TimestampedObject<Pose3d> p : poses.readQueue()) {
+  poseEstimator.addVisionMeasurement(p.value.toPose2d(), p.timestamp / 1e6);
+}
+```
+
+Reading corners from `frame`:
 
 ```java
 DoubleArraySubscriber frames = NetworkTableInstance.getDefault()
@@ -75,6 +95,36 @@ for (TimestampedDoubleArray f : frames.readQueue()) {
 }
 ```
 
+## Poses
+
+Each tag's pose relative to the camera is solved from its four corners (IPPE, then a least-squares
+refinement), and from the tags the field layout knows, the robot's pose on the field: jointly over
+every corner when several tags are in view, from the one tag's pose otherwise. Poses use WPILib's
+conventions: the camera frame is X forward, Y left, Z up, and tags face out along their +X. With no
+field layout selected, no poses are solved at all (tags are still detected and published).
+
+- **Camera model.** `--calibration` loads a PhotonVision calibration export (JSON) for the camera, at
+  any resolution scaling to the one streamed. Without one, the camera is approximated from a diagonal
+  field of view (`--fov`, default 70°) with no lens distortion. That's fine for trying things out,
+  but distances and angles will be off by a few percent; calibrate for real use.
+- **Field.** `--field-layout` is the name of a known layout, a WPILib field layout JSON file, or
+  `none` for no poses. Without it, `2026-rebuilt-welded` is used if it's found, else none. It can be
+  changed while running (see Live settings). Known layouts are read at startup from every `fields`
+  directory found among `/usr/share/sonoma-vision/fields`, `/usr/local/share/sonoma-vision/fields`,
+  `./fields` (the working directory) and `fields` beside the executable; each `*.json` is named by its
+  file stem. If two directories have the same name, the last in that order wins. The repository's
+  `fields/` has `2026-rebuilt-welded` and `2026-rebuilt-andymark`.
+- **Mounting.** `--robot-to-camera x,y,z,roll,pitch,yaw` is the camera's pose on the robot (metres
+  forward, left and up from the robot's origin; degrees), as WPILib's robot-to-camera transform.
+- **Tag size.** `--tag-size`, the black square's side in metres (FRC: 0.1651, 6.5 in).
+- **Ambiguity.** A single tag seen nearly face-on has two poses that fit almost equally well (the
+  second is mirrored about the line of sight). `ambiguity` is the better fit's error over the other's:
+  near 0 it's clear, near 1 it's a coin toss. Single-tag robot poses above `--max-ambiguity` (default
+  0.2) aren't published. Several tags at once settle it.
+
+On synthetic frames with an exact camera model, tag positions come back within about 0.02% of the
+distance and orientations within a degree (`tests/pose.rs`).
+
 ## Live settings
 
 These can be changed while running, from a dashboard or the robot program, under `<table>/settings/`:
@@ -86,6 +136,12 @@ These can be changed while running, from a dashboard or the robot program, under
 | `min_contrast` | int | `--min-contrast` | Grey levels required between tag black and white (1-255) |
 | `stream_auto_levels` | boolean | `--stream-auto-levels` | Stretch the stream to the full grey range (default true) |
 | `stream_gamma` | double | `--stream-gamma` | Stream gamma, 0.1-10; above 1 lifts shadows (default 1) |
+| `field_layout/` | String Chooser | `--field-layout` | The field layout poses are solved against, or `none` |
+
+`field_layout/` is laid out like WPILib's `SendableChooser`, so Elastic and Shuffleboard show it as a
+drop-down: `options` (string[]) lists the layouts found plus `none`, `default` is the command line's,
+`active` is the one in use, and writing a name to `selected` switches to it. Only `selected` is
+persistent.
 
 They're persistent topics, so the robot's NT server saves them across restarts. **Values the server
 already has win over the command line's**: the command line only sets settings the server doesn't
@@ -151,10 +207,11 @@ Building needs libclang: v4l2r generates its V4L2 bindings with bindgen.
 
 `tools/build-systemcore.sh` cross-compiles for aarch64. It needs `gcc-aarch64-linux-gnu` and
 `libc6-dev-arm64-cross` (see the script). The binary needs glibc 2.35 or newer. Then copy the binary to
-`/usr/local/bin/`, the unit to `/etc/systemd/system/`, and a config per camera:
+`/usr/local/bin/`, the field layouts to `/usr/local/share/sonoma-vision/fields/`, the unit to `/etc/systemd/system/`, and a config per camera:
 
 ```sh
 sudo install -m 755 sonoma-vision /usr/local/bin/
+sudo install -D -m 644 -t /usr/local/share/sonoma-vision/fields fields/*.json
 sudo install -m 644 deploy/sonoma-vision@.service /etc/systemd/system/
 sudo install -D -m 644 deploy/cam0.env /etc/sonoma-vision/cam0.env
 sudo systemctl daemon-reload && sudo systemctl enable --now sonoma-vision@cam0

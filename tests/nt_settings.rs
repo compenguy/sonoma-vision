@@ -26,6 +26,7 @@ fn binary(id: i64, value: Value) -> Message {
     let type_idx = match value {
         Value::Boolean(_) => 0,
         Value::F64(_) => 1,
+        Value::String(_) => 4,
         _ => 2,
     };
     let mut buf = Vec::new();
@@ -138,29 +139,42 @@ async fn settings_adopt_persisted_values_publish_the_rest_and_follow_edits() {
     let port = listener.local_addr().unwrap().port();
     let (seen_tx, mut seen) = mpsc::unbounded_channel();
     let (edit, edits) = mpsc::unbounded_channel();
-    // The server kept gain = 120 from an earlier run.
-    let persisted = vec![("/sonoma/test/settings/gain".to_string(), "int", Value::from(120))];
+    // The server kept gain = 120 and the field layout b from an earlier run.
+    let persisted = vec![
+        ("/sonoma/test/settings/gain".to_string(), "int", Value::from(120)),
+        ("/sonoma/test/settings/field_layout/selected".to_string(), "string", Value::from("b")),
+    ];
     tokio::spawn(fake_server(listener, persisted, seen_tx, edits));
 
     let (_results_tx, results) = watch::channel(None);
-    let (settings_tx, mut settings) = watch::channel(Settings { exposure: Some(50), ..Settings::default() });
+    let (settings_tx, mut settings) =
+        watch::channel(Settings { exposure: Some(50), field_layout: Some("a".into()), ..Settings::default() });
     let cfg = NtConfig {
         server: nt::parse_server("127.0.0.1").unwrap(),
         port,
         client_name: "test".into(),
         table: "/sonoma/test".into(),
         camera: None,
+        field_layouts: vec!["a".into(), "b".into()],
     };
     tokio::spawn(nt::run(cfg, results, settings_tx));
 
     // The persisted value wins over the command line's (gain: the camera's own).
     wait_for(&mut settings, "the persisted gain", |s| s.gain == Some(120)).await;
+    wait_for(&mut settings, "the persisted field layout", |s| s.field_layout.as_deref() == Some("b")).await;
 
     // Every setting is published as persistent, and ours are set for the settings the server lacked.
     let mut published = HashMap::new();
     let mut values = HashMap::new();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while values.len() < 4 {
+    let chooser = "/sonoma/test/settings/field_layout/";
+    let wanted = ["exposure", "min_contrast", "stream_auto_levels", "stream_gamma"];
+    let chooser_wanted = [".type", "options", "default", "active"];
+    let have_all = |v: &HashMap<String, Value>| {
+        wanted.iter().all(|k| v.contains_key(*k))
+            && chooser_wanted.iter().all(|k| v.contains_key(&format!("field_layout/{k}")))
+    };
+    while !have_all(&values) {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match tokio::time::timeout(remaining, seen.recv()).await.expect("settings weren't all published").unwrap() {
             Seen::Publish(name, props) => {
@@ -182,6 +196,13 @@ async fn settings_adopt_persisted_values_publish_the_rest_and_follow_edits() {
     assert_eq!(values["stream_auto_levels"], Value::from(true));
     assert_eq!(values["stream_gamma"], Value::from(1.0));
     assert!(!values.contains_key("gain"), "the server's gain was overwritten");
+    // The field layout chooser, as a SendableChooser: the server's selection was adopted.
+    assert_eq!(values["field_layout/.type"], Value::from("String Chooser"));
+    assert_eq!(values["field_layout/options"], Value::Array(vec!["a".into(), "b".into(), "none".into()]));
+    assert_eq!(values["field_layout/default"], Value::from("a"));
+    assert_eq!(values["field_layout/active"], Value::from("b"));
+    assert!(!values.contains_key("field_layout/selected"), "the server's selection was overwritten");
+    assert_eq!(published[&format!("{chooser}selected")]["persistent"], true);
 
     // A dashboard's edits apply; invalid ones are ignored.
     edit.send(("/sonoma/test/settings/stream_gamma".into(), Value::from(0.0))).unwrap();
@@ -190,4 +211,23 @@ async fn settings_adopt_persisted_values_publish_the_rest_and_follow_edits() {
     assert_eq!(settings.borrow().stream_gamma, 1.0);
     edit.send(("/sonoma/test/settings/exposure".into(), Value::from(-1))).unwrap();
     wait_for(&mut settings, "auto exposure", |s| s.exposure.is_none()).await;
+
+    // Selecting a layout that isn't there is ignored (`active` stays b); `none` turns poses off, and
+    // `active` follows.
+    edit.send((format!("{chooser}selected"), Value::from("c"))).unwrap();
+    edit.send((format!("{chooser}selected"), Value::from("none"))).unwrap();
+    wait_for(&mut settings, "no field layout", |s| s.field_layout.is_none()).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let msg = tokio::time::timeout(remaining, seen.recv()).await.expect("active wasn't updated").unwrap();
+        if let Seen::Value(name, v) = msg
+            && name == format!("{chooser}active")
+        {
+            if v == Value::from("none") {
+                break;
+            }
+            assert_eq!(v, Value::from("b"), "active only follows valid selections");
+        }
+    }
 }
