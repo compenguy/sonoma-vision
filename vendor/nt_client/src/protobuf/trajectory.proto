@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package wpi.proto;
+
+import "geometry2d.proto";
+
+message ProtobufTrajectoryState {
+  double time = 1;
+  double velocity = 2;
+  double acceleration = 3;
+  ProtobufPose2d pose = 4;
+  double curvature = 5;
+}
+
+message ProtobufTrajectory {
+  repeated ProtobufTrajectoryState states = 2;
+}

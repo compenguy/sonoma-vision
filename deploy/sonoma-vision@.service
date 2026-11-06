@@ -1,0 +1,22 @@
+# One instance per camera: `systemctl enable --now sonoma-vision@cam0` reads /etc/sonoma-vision/cam0.env.
+[Unit]
+Description=sonoma-vision AprilTag processor (%i)
+After=network.target
+
+[Service]
+Environment=RUST_LOG=info
+Environment=SONOMA_TABLE=/sonoma/%i
+Environment=SONOMA_NT_NAME=sonoma-vision-%i
+# SONOMA_DEVICE, SONOMA_NT_SERVER and SONOMA_ARGS (any other flags, e.g. "--width 1280 --height 720 --exposure 50").
+EnvironmentFile=/etc/sonoma-vision/%i.env
+ExecStart=/usr/local/bin/sonoma-vision $SONOMA_ARGS
+Restart=always
+RestartSec=2
+# Run unprivileged; the video group grants camera access.
+DynamicUser=yes
+SupplementaryGroups=video
+# Favour frame processing over background work on the controller.
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+sonoma-vision
+Copyright (c) 2026 William Page
+
+sonoma-vision is free software under the GNU General Public License, version 3 only (GPL-3.0-only);
+see LICENSE.
+
+The AprilTag detector in src/detector is based on NAPA, Copyright (c) 2026 Zachary Wilson
+(https://github.com/zwatx/NAPA), used under the GPL-3.0-only. As NAPA's additional term under
+section 7(b) of the GPL requires, works based on NAPA must keep this notice and credit Zachary Wilson
+as NAPA's author in their Appropriate Legal Notices.
+
+The tag families' codewords (src/detector/families, generated from vendor/apriltag) come from
+AprilTag (https://github.com/AprilRobotics/apriltag), Copyright (C) 2013-2016, The Regents of The
+University of Michigan, under the BSD 2-Clause license in vendor/apriltag/LICENSE.md and each file.
+
+vendor/nt_client is nt_client 0.5.1 by DatAsianBoi123 (https://github.com/DatAsianBoi123/nt_client),
+under the MIT license, with the local patches listed in vendor/nt_client/PATCHES.md.
