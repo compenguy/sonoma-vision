@@ -35,6 +35,47 @@ pub struct PoseConfig {
     pub max_ambiguity: f64,
 }
 
+/// The camera's pose on the robot as it's configured: x, y, z in metres (forward, left, up from the
+/// robot's origin), then roll, pitch, yaw in degrees. Written `x,y,z,roll,pitch,yaw`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MountPose(pub [f64; 6]);
+
+impl MountPose {
+    /// WPILib's robot-to-camera transform.
+    pub fn isometry(&self) -> Isometry3<f64> {
+        let [x, y, z, roll, pitch, yaw] = self.0;
+        Isometry3::from_parts(
+            nalgebra::Translation3::new(x, y, z),
+            UnitQuaternion::from_euler_angles(roll.to_radians(), pitch.to_radians(), yaw.to_radians()),
+        )
+    }
+
+    /// From six numbers, which must be finite.
+    pub fn from_slice(v: &[f64]) -> Result<Self, String> {
+        match <[f64; 6]>::try_from(v) {
+            Ok(a) if a.iter().all(|x| x.is_finite()) => Ok(Self(a)),
+            Ok(_) => Err("x,y,z,roll,pitch,yaw must be finite".into()),
+            Err(_) => Err(format!("expected x,y,z,roll,pitch,yaw (6 numbers), got {}", v.len())),
+        }
+    }
+}
+
+impl std::str::FromStr for MountPose {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let v: Vec<f64> =
+            s.split(',').map(|p| p.trim().parse::<f64>()).collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+        Self::from_slice(&v)
+    }
+}
+
+impl std::fmt::Display for MountPose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let parts: Vec<String> = self.0.iter().map(f64::to_string).collect();
+        f.write_str(&parts.join(","))
+    }
+}
+
 /// One tag's pose relative to the camera.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TagPose {

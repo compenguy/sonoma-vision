@@ -6,6 +6,7 @@
 
 pub mod capture;
 pub mod clock;
+pub mod config;
 pub mod detector;
 pub mod nt;
 pub mod pose;

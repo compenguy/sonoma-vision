@@ -25,16 +25,22 @@
 //! dashboards list it. (Elastic only recognises a camera with all of them.)
 //!
 //! Settings that can be changed while running live under `<table>/settings/` (see
-//! [`crate::settings::Key`]): `exposure`, `gain`, `min_contrast`, `stream_auto_levels`, `stream_gamma`.
-//! They're persistent topics, so the robot's NT server keeps them across restarts. On connecting,
-//! values already on the server win over the command line's; settings the server doesn't have are
-//! published from ours. Edits from a dashboard or the robot program apply immediately.
+//! [`crate::settings::Key`]): camera exposure, gain and focus, the detector's thresholds, the pose
+//! solver's mount and ambiguity limit, and the stream's look, rate and size. They're persistent topics,
+//! so the robot's NT server keeps them across restarts. On connecting, values already on the server
+//! win over the configuration's; settings the server doesn't have are published from ours. Edits from
+//! a dashboard or the robot program apply immediately.
 //!
-//! The field layout is chosen under `<table>/settings/field_layout/`, laid out as WPILib's
-//! `SendableChooser` (`.type` "String Chooser", `options`, `default`, `active`, `selected`) so
-//! dashboards show it as a drop-down. `options` lists the layouts found and `none`, which turns pose
-//! solving off; writing one to `selected` switches to it, and `active` is the one in use. `selected`
-//! is persistent and, like the other settings, the server's value wins on connecting.
+//! The field layout and the capture mode are chosen under `<table>/settings/field_layout/` and
+//! `<table>/settings/capture_mode/`, laid out as WPILib's `SendableChooser` (`.type` "String
+//! Chooser", `options`, `default`, `active`, `selected`) so dashboards show them as drop-downs.
+//! Writing an option to `selected` switches to it, and `active` is the one in use. `field_layout`
+//! offers the layouts found and `none`, which turns pose solving off. `capture_mode` offers the
+//! camera's modes (from the vision thread's [`CameraState`]); an empty selection is the
+//! configuration's mode. `selected` is persistent and, like the other settings, the server's value
+//! wins on connecting.
+//!
+//! With the camera stream on, `<table>/config_url` is where the configuration in effect is served.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -55,6 +61,7 @@ use nt_client::topic::Properties;
 use nt_client::{ClientHandle, NTAddr, NewClientOptions};
 use tokio::sync::watch;
 
+use crate::capture::{CameraState, Mode};
 use crate::clock::monotonic_now;
 use crate::detector::Detection;
 use crate::pose::{FieldPose, TagPose};
@@ -105,6 +112,8 @@ pub struct NtConfig {
     pub camera: Option<CameraAdvert>,
     /// The field layouts that can be selected, by name.
     pub field_layouts: Vec<String>,
+    /// The camera's modes and the one streaming, from the vision thread.
+    pub camera_state: watch::Receiver<CameraState>,
 }
 
 /// A camera stream to advertise under `/CameraPublisher/<name>`.
@@ -115,8 +124,6 @@ pub struct CameraAdvert {
     pub port: u16,
     /// What the stream shows, e.g. `usb:/dev/video0`.
     pub source: String,
-    /// The stream's video mode, as CameraServer writes it: `320x240 MJPEG 15 fps`.
-    pub mode: String,
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -138,12 +145,14 @@ pub async fn run(
     };
     let table = cfg.table.trim_end_matches('/').to_string();
     let camera = cfg.camera;
+    let camera_state = cfg.camera_state;
     let chooser =
         Arc::new(Chooser { options: cfg.field_layouts, default: settings.borrow().field_layout_name().into() });
     let mut attempt = 0u32;
     let outcome = nt_client::reconnect(options, |client| {
         let table = table.clone();
         let camera = camera.clone();
+        let camera_state = camera_state.clone();
         let results = results.clone();
         let settings = settings.clone();
         let chooser = chooser.clone();
@@ -151,11 +160,28 @@ pub async fn run(
         let delay = if attempt > 1 { Duration::from_secs(1) } else { Duration::ZERO };
         async move {
             tokio::time::sleep(delay).await;
-            let sync =
-                tokio::spawn(sync_settings(client.handle().clone(), format!("{table}/settings"), settings, chooser));
-            let publish = tokio::spawn(publish_loop(client.handle().clone(), table, camera, results));
-            // Dropping a spawned task's handle doesn't stop it: abort the settings task with the connection.
+            let handle = client.handle().clone();
+            let advertise = camera.map(|c| {
+                let (settings, state) = (settings.subscribe(), camera_state.clone());
+                tokio::spawn(advertise_loop(handle.clone(), table.clone(), c, settings, state))
+            });
+            let sync = tokio::spawn(sync_settings(
+                handle.clone(),
+                format!("{table}/settings"),
+                settings,
+                chooser,
+                camera_state,
+            ));
+            let publish = tokio::spawn(publish_loop(handle, table, results));
+            // Dropping a spawned task's handle doesn't stop it: abort the others with the connection.
             let _sync = AbortOnDrop(sync.abort_handle());
+            let _advertise = advertise.as_ref().map(|a| AbortOnDrop(a.abort_handle()));
+            let advertised = async {
+                match advertise {
+                    Some(a) => a.await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 res = client.connect() => {
                     warn!("NetworkTables connection ended: {res:?}");
@@ -173,6 +199,11 @@ pub async fn run(
                 res = sync => match res {
                     Ok(Err(e)) => Err(ReconnectError::Nonfatal(e)),
                     Ok(Ok(())) => Err(ReconnectError::Nonfatal("settings subscription ended".into())),
+                    Err(e) => Err(ReconnectError::Fatal(e.into())),
+                },
+                res = advertised => match res {
+                    Ok(Err(e)) => Err(ReconnectError::Nonfatal(e)),
+                    Ok(Ok(())) => Err(ReconnectError::Nonfatal("camera advertisement ended".into())),
                     Err(e) => Err(ReconnectError::Fatal(e.into())),
                 },
             }
@@ -200,7 +231,6 @@ struct Publishers {
 async fn publish_loop(
     client: ClientHandle,
     table: String,
-    camera: Option<CameraAdvert>,
     mut results: watch::Receiver<Option<Arc<FrameResult>>>,
 ) -> Result<(), BoxError> {
     let topic = |name: &str| client.topic(format!("{table}/{name}"));
@@ -227,11 +257,6 @@ async fn publish_loop(
     };
     p.field_type.set("Field2d".to_string()).await?;
     info!("publishing to {table}");
-    // Held for the connection: the advertisement lasts as long as its publishers.
-    let _camera = match &camera {
-        Some(c) => Some(advertise_camera(&client, c).await?),
-        None => None,
-    };
     let time = client.time();
     let mut tags: HashMap<u32, TagPublishers> = HashMap::new();
     loop {
@@ -407,7 +432,24 @@ struct CameraPublishers {
     modes: Publisher<Vec<String>>,
 }
 
-async fn advertise_camera(client: &ClientHandle, c: &CameraAdvert) -> Result<CameraPublishers, BoxError> {
+/// The stream's video mode as CameraServer writes it (`320x240 MJPEG 15 fps`): the camera's mode
+/// scaled down, at the stream's rate if that's lower. None while the camera is closed.
+pub fn stream_mode(state: &CameraState, s: &Settings) -> Option<String> {
+    let m = state.active?;
+    let scale = u32::from(s.stream_scale.max(1));
+    let fps = if m.fps == 0 { s.stream_fps } else { s.stream_fps.min(f64::from(m.fps)) };
+    Some(format!("{}x{} MJPEG {} fps", m.width / scale, m.height / scale, fps.round()))
+}
+
+/// Advertise the camera stream for one connection, keeping its mode in step with the camera and the
+/// stream settings, and publish `<table>/config_url`.
+async fn advertise_loop(
+    client: ClientHandle,
+    table: String,
+    c: CameraAdvert,
+    mut settings: watch::Receiver<Settings>,
+    mut state: watch::Receiver<CameraState>,
+) -> Result<(), BoxError> {
     let topic = |name: &str| client.topic(format!("/CameraPublisher/{}/{name}", c.name));
     let urls = crate::stream::stream_urls(c.port);
     info!("advertising camera stream {:?}: {}", c.name, urls.join(", "));
@@ -419,13 +461,30 @@ async fn advertise_camera(client: &ClientHandle, c: &CameraAdvert) -> Result<Cam
         mode: topic("mode").publish_bypass(Default::default()).await?,
         modes: topic("modes").publish_bypass(Default::default()).await?,
     };
+    let config_url: Publisher<String> =
+        client.topic(format!("{table}/config_url")).publish_bypass(Default::default()).await?;
     p.streams.set(urls).await?;
     p.source.set(c.source.clone()).await?;
     p.description.set("sonoma-vision AprilTag camera".to_string()).await?;
     p.connected.set(true).await?;
-    p.mode.set(c.mode.clone()).await?;
-    p.modes.set(vec![c.mode.clone()]).await?;
-    Ok(p)
+    config_url.set(crate::stream::config_url(c.port)).await?;
+    let mut shown = None;
+    let (mut settings_open, mut state_open) = (true, true);
+    loop {
+        let mode = stream_mode(&state.borrow_and_update(), &settings.borrow_and_update());
+        if mode.is_some() && mode != shown {
+            let m = mode.clone().unwrap_or_default();
+            p.mode.set(m.clone()).await?;
+            p.modes.set(vec![m]).await?;
+            shown = mode;
+        }
+        tokio::select! {
+            r = settings.changed(), if settings_open => settings_open = r.is_ok(),
+            r = state.changed(), if state_open => state_open = r.is_ok(),
+            // Both gone: the service is shutting down; hold the advertisement until it does.
+            () = std::future::pending(), if !settings_open && !state_open => {}
+        }
+    }
 }
 
 struct AbortOnDrop(tokio::task::AbortHandle);
@@ -440,40 +499,44 @@ impl Drop for AbortOnDrop {
 struct Chooser {
     /// The layouts that can be selected (without `none`).
     options: Vec<String>,
-    /// What the command line chose.
+    /// What the configuration chose.
     default: String,
 }
 
-/// The field layout chooser's topics, under `<settings>/field_layout/`.
+/// A `SendableChooser`'s topics, under `<settings>/<name>/`.
 struct ChooserPublishers {
     _type: Publisher<String>,
     _controllable: Publisher<bool>,
-    _options: Publisher<Vec<String>>,
-    _default: Publisher<String>,
+    options: Publisher<Vec<String>>,
+    default: Publisher<String>,
     active: Publisher<String>,
     selected: Publisher<String>,
 }
 
 impl ChooserPublishers {
-    async fn new(client: &ClientHandle, prefix: &str, chooser: &Chooser) -> Result<Self, BoxError> {
+    async fn new(client: &ClientHandle, prefix: &str, options: Vec<String>, default: String) -> Result<Self, BoxError> {
         let topic = |name: &str| client.topic(format!("{prefix}/{name}"));
         let persistent = Properties { persistent: Some(true), ..Default::default() };
         let p = Self {
             _type: topic(".type").publish_bypass(Default::default()).await?,
             _controllable: topic(".controllable").publish_bypass(Default::default()).await?,
-            _options: topic("options").publish_bypass(Default::default()).await?,
-            _default: topic("default").publish_bypass(Default::default()).await?,
+            options: topic("options").publish_bypass(Default::default()).await?,
+            default: topic("default").publish_bypass(Default::default()).await?,
             active: topic("active").publish_bypass(Default::default()).await?,
             selected: topic("selected").publish_bypass(persistent).await?,
         };
         p._type.set("String Chooser".to_string()).await?;
         p._controllable.set(true).await?;
-        let mut options = chooser.options.clone();
-        options.push(NO_LAYOUT.to_string());
-        p._options.set(options).await?;
-        p._default.set(chooser.default.clone()).await?;
+        p.options.set(options).await?;
+        p.default.set(default).await?;
         Ok(p)
     }
+}
+
+/// The capture mode chooser's options, default and active mode, as published.
+fn mode_chooser(state: &CameraState) -> (Vec<String>, String, String) {
+    let name = |m: Option<Mode>| m.map(|m| m.to_string()).unwrap_or_default();
+    (state.modes.iter().map(Mode::to_string).collect(), name(state.default), name(state.active))
 }
 
 /// What a message under the settings prefix was.
@@ -481,6 +544,13 @@ impl ChooserPublishers {
 enum Setting {
     Key(Key),
     FieldLayout,
+    CaptureMode,
+}
+
+/// The choosers' `selected` topics.
+struct Selected {
+    field_layout: String,
+    capture_mode: String,
 }
 
 /// Keep `settings` and the persistent topics under `prefix` in step for one connection: adopt what
@@ -490,6 +560,7 @@ async fn sync_settings(
     prefix: String,
     settings: Arc<watch::Sender<Settings>>,
     chooser: Arc<Chooser>,
+    mut camera: watch::Receiver<CameraState>,
 ) -> Result<(), BoxError> {
     // Subscribe first, so values the server already has arrive while we publish.
     let options = SubscriptionOptions { prefix: Some(true), ..Default::default() };
@@ -501,14 +572,22 @@ async fn sync_settings(
             NtValue::Int(_) => DataType::Int,
             NtValue::Bool(_) => DataType::Boolean,
             NtValue::Double(_) => DataType::Double,
+            NtValue::DoubleArray(_) => DataType::DoubleArray,
         };
         let topic = client.topic(format!("{prefix}/{}", key.name()));
         publishers.push((key, topic.generic_publish_bypass(data_type, properties.clone()).await?));
     }
-    let layout_prefix = format!("{prefix}/field_layout");
-    let layout = ChooserPublishers::new(&client, &layout_prefix, &chooser).await?;
-    let selected_topic = format!("{layout_prefix}/selected");
-    let apply = |msg| apply_setting(&settings, &selected_topic, &chooser.options, msg);
+    let mut layouts = chooser.options.clone();
+    layouts.push(NO_LAYOUT.to_string());
+    let layout =
+        ChooserPublishers::new(&client, &format!("{prefix}/field_layout"), layouts, chooser.default.clone()).await?;
+    let (modes, default_mode, active_mode) = mode_chooser(&camera.borrow_and_update());
+    let capture = ChooserPublishers::new(&client, &format!("{prefix}/capture_mode"), modes, default_mode).await?;
+    let selected = Selected {
+        field_layout: format!("{prefix}/field_layout/selected"),
+        capture_mode: format!("{prefix}/capture_mode/selected"),
+    };
+    let apply = |msg| apply_setting(&settings, &selected, &chooser.options, msg);
 
     // Take in what the server sent while we were publishing (its values arrive right after we
     // subscribe), then publish ours for the settings it doesn't have.
@@ -527,35 +606,54 @@ async fn sync_settings(
     if !adopted.contains(&Setting::FieldLayout) {
         layout.selected.set(current.field_layout_name().to_string()).await?;
     }
+    if !adopted.contains(&Setting::CaptureMode) {
+        // Empty: the configuration's mode. A mode chosen live persists until it's cleared.
+        let mode = current.capture_mode.map(|m| m.to_string()).unwrap_or_default();
+        capture.selected.set(mode).await?;
+    }
     layout.active.set(current.field_layout_name().to_string()).await?;
+    capture.active.set(active_mode).await?;
     info!("settings under {prefix}: {current:?}");
 
+    let mut camera_open = true;
     loop {
-        match sub.recv().await {
-            Ok(msg) => {
-                if apply(msg) == Some(Setting::FieldLayout) {
-                    let active = settings.borrow().field_layout_name().to_string();
-                    layout.active.set(active).await?;
+        tokio::select! {
+            msg = sub.recv() => match msg {
+                Ok(msg) => {
+                    if apply(msg) == Some(Setting::FieldLayout) {
+                        let active = settings.borrow().field_layout_name().to_string();
+                        layout.active.set(active).await?;
+                    }
                 }
+                // Only the latest value of each setting matters.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => return Err(e.into()),
+            },
+            // The capture mode's `active` follows the camera, which reopens in the chosen mode.
+            r = camera.changed(), if camera_open => {
+                camera_open = r.is_ok();
+                let (modes, default, active) = mode_chooser(&camera.borrow_and_update());
+                capture.options.set(modes).await?;
+                capture.default.set(default).await?;
+                capture.active.set(active).await?;
             }
-            // Only the latest value of each setting matters.
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(e) => return Err(e.into()),
         }
     }
 }
 
-/// Apply a setting update received from NT (`selected_topic` being the field layout's selection, one
-/// of `layouts`), returning which setting it was.
+/// Apply a setting update received from NT (`selected` being the choosers' selections; field layouts
+/// one of `layouts`), returning which setting it was.
 fn apply_setting(
     settings: &watch::Sender<Settings>,
-    selected_topic: &str,
+    selected: &Selected,
     layouts: &[String],
     msg: ReceivedMessage,
 ) -> Option<Setting> {
     let ReceivedMessage::Updated((topic, value)) = msg else { return None };
-    let (setting, name) = if topic.name() == selected_topic {
+    let (setting, name) = if topic.name() == selected.field_layout {
         (Setting::FieldLayout, "field_layout")
+    } else if topic.name() == selected.capture_mode {
+        (Setting::CaptureMode, "capture_mode")
     } else {
         let key = Key::from_name(topic.name().rsplit('/').next()?)?;
         (Setting::Key(key), key.name())
@@ -563,12 +661,11 @@ fn apply_setting(
     let mut result = Ok(());
     settings.send_if_modified(|s| {
         let before = s.clone();
-        result = match setting {
-            Setting::Key(key) => s.set(key, &value),
-            Setting::FieldLayout => match value.as_str() {
-                Some(v) => s.set_field_layout(v, layouts),
-                None => Err(format!("field_layout must be a string, not {value}")),
-            },
+        result = match (setting, value.as_str()) {
+            (Setting::Key(key), _) => s.set(key, &value),
+            (Setting::FieldLayout, Some(v)) => s.set_field_layout(v, layouts),
+            (Setting::CaptureMode, Some(v)) => s.set_capture_mode(v),
+            (_, None) => Err(format!("{name} must be a string, not {value}")),
         };
         *s != before
     });
@@ -584,6 +681,7 @@ async fn set_generic(publisher: &GenericPublisher, value: NtValue) -> Result<(),
         NtValue::Int(v) => publisher.set(v).await?,
         NtValue::Bool(v) => publisher.set(v).await?,
         NtValue::Double(v) => publisher.set(v).await?,
+        NtValue::DoubleArray(v) => publisher.set(v).await?,
     }
     Ok(())
 }

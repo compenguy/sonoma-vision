@@ -1,0 +1,16 @@
+# /etc/sonoma-vision/sonoma-vision.toml: settings shared by every camera on this controller. Each
+# camera's own file (/etc/sonoma-vision/<camera>.toml) is read after this one and wins.
+# `sonoma-vision --print-config` lists every key with its description and default.
+
+[nt]
+# `local`: the robot program's NT server on this controller.
+server = "local"
+
+[detector]
+family = "tag36h11"
+
+[pose]
+field_layout = "2026-rebuilt-welded"
+
+[log]
+level = "info"

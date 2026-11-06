@@ -84,6 +84,60 @@ pub struct CameraConfig {
     pub buffers: u32,
 }
 
+impl CameraConfig {
+    /// This configuration with `mode`'s size, rate and format.
+    pub fn with_mode(&self, mode: &Mode) -> Self {
+        Self { width: mode.width, height: mode.height, fps: Some(mode.fps), layout: Some(mode.layout), ..self.clone() }
+    }
+}
+
+/// A capture mode a camera lists: size, frame rate and pixel format. Written as `1280x720 MJPG 120fps`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mode {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub layout: Layout,
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let fourcc = std::str::from_utf8(self.layout.fourcc()).unwrap_or("?");
+        write!(f, "{}x{} {fourcc} {}fps", self.width, self.height, self.fps)
+    }
+}
+
+impl std::str::FromStr for Mode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let bad = || format!("capture mode must look like `1280x720 MJPG 120fps`, not {s:?}");
+        let mut parts = s.split_whitespace();
+        let (Some(size), Some(format), Some(fps), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(bad());
+        };
+        let (w, h) = size.split_once('x').ok_or_else(bad)?;
+        let num = |v: &str| v.parse::<u32>().ok().filter(|&n| n > 0).ok_or_else(bad);
+        Ok(Self {
+            width: num(w)?,
+            height: num(h)?,
+            fps: num(fps.strip_suffix("fps").unwrap_or(fps))?,
+            layout: format.parse().map_err(|_| bad())?,
+        })
+    }
+}
+
+/// What the vision thread reports about its camera, for the capture mode chooser.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CameraState {
+    /// The modes the camera lists that the detector can read, most preferred format first.
+    pub modes: Vec<Mode>,
+    /// The mode streaming now; None while the camera is closed.
+    pub active: Option<Mode>,
+    /// The mode the configuration (files and command line) opened.
+    pub default: Option<Mode>,
+}
+
 /// One captured frame, borrowing the driver's buffer until the next frame is requested.
 pub struct Frame<'a> {
     pub data: &'a [u8],
@@ -273,6 +327,66 @@ impl Camera {
             }
         }
         Ok(())
+    }
+
+    /// Manual focus in driver units (turning autofocus off), or None for autofocus.
+    pub fn set_focus(&self, focus: Option<i32>) -> Result<()> {
+        let auto = |on: bool| ioctl::s_ctrl(&self.fd, bindings::V4L2_CID_FOCUS_AUTO, i32::from(on));
+        match focus {
+            Some(focus) => {
+                auto(false).map_err(|e| anyhow!("turning autofocus off: {e}"))?;
+                let got = ioctl::s_ctrl(&self.fd, bindings::V4L2_CID_FOCUS_ABSOLUTE, focus)
+                    .map_err(|e| anyhow!("setting focus {focus}: {e}"))?;
+                info!("focus set to {got}");
+            }
+            None => {
+                auto(true).map_err(|e| anyhow!("turning autofocus on: {e}"))?;
+                info!("autofocus");
+            }
+        }
+        Ok(())
+    }
+
+    /// The capture modes the camera lists in formats the detector reads: discrete sizes, each at
+    /// its listed frame rates (a range's fastest), most preferred format first, then largest and
+    /// fastest first.
+    pub fn modes(&self) -> Vec<Mode> {
+        let mut modes = Vec::new();
+        let offered: Vec<Layout> =
+            FormatIterator::new(&self.fd, QUEUE).filter_map(|f| Layout::from_fourcc(f.pixelformat)).collect();
+        for layout in Layout::ALL.into_iter().filter(|l| offered.contains(l)) {
+            let pf = PixelFormat::from(layout.fourcc());
+            let sizes =
+                (0..).map_while(|i| ioctl::enum_frame_sizes::<bindings::v4l2_frmsizeenum>(&self.fd, i, pf).ok());
+            for size in sizes.filter_map(|e| SizeRange::from_enum(&e)) {
+                let SizeRange::Discrete(width, height) = size else { continue };
+                let rates = (0..).map_while(|i| {
+                    ioctl::enum_frame_intervals::<bindings::v4l2_frmivalenum>(&self.fd, i, pf, width, height).ok()
+                });
+                for rate in rates.filter_map(|e| RateRange::from_enum(&e)) {
+                    let fps = rate.max_fps().round() as u32;
+                    let mode = Mode { width, height, fps, layout };
+                    if fps > 0 && !modes.contains(&mode) {
+                        modes.push(mode);
+                    }
+                }
+            }
+        }
+        let rank = |m: &Mode| Layout::ALL.iter().position(|l| *l == m.layout);
+        modes.sort_by(|a, b| {
+            rank(a).cmp(&rank(b)).then((b.width * b.height).cmp(&(a.width * a.height))).then(b.fps.cmp(&a.fps))
+        });
+        modes
+    }
+
+    /// The mode streaming now (the frame rate rounded).
+    pub fn mode(&self) -> Mode {
+        Mode {
+            width: self.width as u32,
+            height: self.height as u32,
+            fps: self.fps.map_or(0, |f| f.round() as u32),
+            layout: self.layout,
+        }
     }
 
     /// Analog gain in driver units.
@@ -521,6 +635,17 @@ mod tests {
         assert_eq!(pick_layout(&offered, fits), Some((Layout::Mjpeg, true)));
         // Nothing fits: the most preferred, for the driver to adjust.
         assert_eq!(pick_layout(&offered, |_| Err(String::new())), Some((Layout::Nv12, false)));
+    }
+
+    #[test]
+    fn modes_read_back() {
+        let m = Mode { width: 1280, height: 720, fps: 120, layout: Layout::Mjpeg };
+        assert_eq!(m.to_string(), "1280x720 MJPG 120fps");
+        assert_eq!("1280x720 MJPG 120fps".parse::<Mode>(), Ok(m));
+        assert_eq!("640x480 yuyv 30".parse::<Mode>().map(|m| (m.layout, m.fps)), Ok((Layout::Yuyv, 30)));
+        for bad in ["1280x720 MJPG", "1280 MJPG 30fps", "0x720 MJPG 30fps", "1280x720 H264 30fps", ""] {
+            assert!(bad.parse::<Mode>().is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -18,7 +18,7 @@ pub use family::Family;
 pub use image::{ImageError, ImageView};
 
 /// Detector tuning.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     /// Smallest tag (black square side, in pixels) the detector guarantees to sample; 8..=30000.
     pub min_tag_px: u32,

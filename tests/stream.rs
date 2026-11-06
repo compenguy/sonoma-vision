@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use sonoma_vision::detector::{Config, Detector, ImageView};
 use sonoma_vision::settings::Settings;
-use sonoma_vision::stream::{self, StreamConfig};
+use sonoma_vision::stream::{self, ConfigPage, StreamConfig};
 use sonoma_vision::synth::Canvas;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -37,9 +37,21 @@ async fn streams_jpeg_frames_with_overlay() {
         Detector::new(family, &Config::default()).unwrap().detect(&ImageView::gray(&gray, 320, 240).unwrap());
     assert_eq!(detections.len(), 1);
 
-    let cfg = StreamConfig { port: 0, fps: 100.0, quality: 80, scale: 2, overlay: true };
-    let (_settings, look) = tokio::sync::watch::channel(Settings::default());
-    let (mut tap, server) = stream::start(&cfg, look).unwrap();
+    let live = Settings {
+        stream_fps: 100.0,
+        stream_quality: 80,
+        stream_scale: 2,
+        stream_overlay: true,
+        ..Settings::default()
+    };
+    let (settings, look) = tokio::sync::watch::channel(live);
+    // The page renders whatever the live settings say, each time it's asked.
+    let page_settings = look.clone();
+    let page = ConfigPage {
+        render: Arc::new(move || format!("[stream]\nscale = {}\n", page_settings.borrow().stream_scale)),
+        filename: "cam0.toml".into(),
+    };
+    let (mut tap, server) = stream::start(&StreamConfig { port: 0 }, look, Some(page)).unwrap();
     let port = server.local_addr().unwrap().port();
     tokio::spawn(server.run());
     // The vision thread's part: offer frames continuously; they're only taken once a client is connected.
@@ -80,6 +92,21 @@ async fn streams_jpeg_frames_with_overlay() {
     let mut other = BufReader::new(TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await.unwrap());
     other.get_mut().write_all(b"GET /favicon.ico HTTP/1.1\r\n\r\n").await.unwrap();
     assert_eq!(headers(&mut other).await[0], "HTTP/1.0 404 Not Found");
+
+    // The configuration page, after a live change; as text, and as a file to save.
+    settings.send_modify(|s| s.stream_scale = 4);
+    for (query, disposition) in
+        [("", None), ("?download", Some("Content-Disposition: attachment; filename=\"cam0.toml\""))]
+    {
+        let mut page = BufReader::new(TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await.unwrap());
+        page.get_mut().write_all(format!("GET /config.toml{query} HTTP/1.1\r\n\r\n").as_bytes()).await.unwrap();
+        let head = headers(&mut page).await;
+        assert_eq!(head[0], "HTTP/1.0 200 OK");
+        assert_eq!(head.iter().any(|h| Some(h.as_str()) == disposition), disposition.is_some(), "{head:?}");
+        let mut body = String::new();
+        page.read_to_string(&mut body).await.unwrap();
+        assert_eq!(body, "[stream]\nscale = 4\n");
+    }
 
     done.store(true, Ordering::Relaxed);
     feeder.join().unwrap();

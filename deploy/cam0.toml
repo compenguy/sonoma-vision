@@ -1,0 +1,26 @@
+# /etc/sonoma-vision/cam0.toml: one camera, read after the shared sonoma-vision.toml.
+
+[camera]
+# A /dev/v4l/by-id path stays the same across reboots and replugging; /dev/videoN numbers don't.
+device = "/dev/video0"
+width = 1280
+height = 720
+fps = 60
+
+[nt]
+# Each camera needs its own table and client name.
+table = "/sonoma/cam0"
+name = "sonoma-vision-cam0"
+
+[stream]
+# A camera stream for dashboards; give each camera its own port (1180-1190 on the field).
+enabled = false
+port = 1190
+scale = 2
+overlay = true
+
+[pose]
+# This camera's calibration (relative to this file) and its pose on the robot: x, y, z in metres
+# (forward, left, up), then roll, pitch, yaw in degrees.
+# calibration = "cam0-calibration.json"
+robot_to_camera = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]

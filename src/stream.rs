@@ -2,6 +2,9 @@
 //! `multipart/x-mixed-replace` JPEG frames over HTTP at `/?action=stream` (or `/?action=snapshot` for
 //! one frame), advertised in NT under `/CameraPublisher` (see [`crate::nt`]).
 //!
+//! The same server serves the configuration in effect, live settings included, at `/config.toml`
+//! (`/config.toml?download` to save it as a file): a `sonoma-vision.toml` to install.
+//!
 //! Streaming never slows detection down: frames are only taken while a client is connected, at most
 //! at the stream's frame rate, and the vision thread's only cost is a (downscaled) copy of the luma.
 //! Image adjustments, overlays and JPEG encoding happen on a separate thread, which skips frames while
@@ -24,46 +27,49 @@ use tokio::sync::watch;
 use crate::detector::{Detection, ImageView};
 use crate::settings::Settings;
 
+/// The stream's fixed settings; its rate, size, quality and overlay are live [`Settings`].
 #[derive(Clone, Debug)]
 pub struct StreamConfig {
     pub port: u16,
-    /// Most frames per second to stream.
-    pub fps: f64,
-    /// JPEG quality, 1-100.
-    pub quality: u8,
-    /// Downscale factor: the stream is the frame's size divided by this.
-    pub scale: usize,
-    /// Draw each detected tag's outline and ID.
-    pub overlay: bool,
+}
+
+/// The configuration page: renders the configuration in effect, and names the file it's saved as.
+#[derive(Clone)]
+pub struct ConfigPage {
+    pub render: Arc<dyn Fn() -> String + Send + Sync>,
+    /// The file name `?download` suggests, e.g. `cam0.toml`.
+    pub filename: String,
 }
 
 /// The latest encoded JPEG, shared with every connected client.
 type Jpeg = Option<Arc<[u8]>>;
 
 /// Start the encoder thread and bind the HTTP port. The [`Tap`] goes to the vision thread; the
-/// [`Server`] runs on the async runtime. `settings` supplies the stream's image adjustments.
-pub fn start(cfg: &StreamConfig, settings: watch::Receiver<Settings>) -> Result<(Tap, Server)> {
+/// [`Server`] runs on the async runtime. `settings` supplies the stream's rate, size and look.
+pub fn start(
+    cfg: &StreamConfig,
+    settings: watch::Receiver<Settings>,
+    config: Option<ConfigPage>,
+) -> Result<(Tap, Server)> {
     let listener = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, cfg.port))
         .with_context(|| format!("camera stream port {}", cfg.port))?;
     listener.set_nonblocking(true)?;
     let clients = Arc::new(AtomicUsize::new(0));
     let (jpeg_tx, jpeg_rx) = watch::channel(None);
     let (snap_tx, snap_rx) = std::sync::mpsc::sync_channel(1);
-    let (quality, overlay) = (cfg.quality.clamp(1, 100), cfg.overlay);
+    let encoder_settings = settings.clone();
     std::thread::Builder::new()
         .name("stream-encode".into())
-        .spawn(move || encode_loop(snap_rx, jpeg_tx, settings, quality, overlay))?;
-    let interval = Duration::from_secs_f64(1.0 / cfg.fps.max(0.1));
-    let tap = Tap { clients: clients.clone(), tx: snap_tx, scale: cfg.scale.max(1), interval, due: Instant::now() };
-    Ok((tap, Server { listener, frames: jpeg_rx, clients }))
+        .spawn(move || encode_loop(snap_rx, jpeg_tx, encoder_settings))?;
+    let tap = Tap { clients: clients.clone(), tx: snap_tx, settings, due: Instant::now() };
+    Ok((tap, Server { listener, frames: jpeg_rx, clients, config }))
 }
 
 /// The vision thread's end of the stream.
 pub struct Tap {
     clients: Arc<AtomicUsize>,
     tx: SyncSender<Snapshot>,
-    scale: usize,
-    interval: Duration,
+    settings: watch::Receiver<Settings>,
     /// When the next frame is due.
     due: Instant,
 }
@@ -75,14 +81,20 @@ impl Tap {
         if self.clients.load(Ordering::Relaxed) == 0 {
             return;
         }
+        let (fps, scale) = {
+            let s = self.settings.borrow();
+            (s.stream_fps, usize::from(s.stream_scale))
+        };
+        let interval = Duration::from_secs_f64(1.0 / fps.max(0.1));
         // A quarter interval of slack, so a frame arriving a little early isn't held to the next one.
         let now = Instant::now();
-        if now + self.interval / 4 < self.due {
+        if now + interval / 4 < self.due {
             return;
         }
-        self.due = (self.due + self.interval).max(now + self.interval / 2);
+        // Also catch up at once if the rate went up, rather than wait out the old interval.
+        self.due = (self.due + interval).max(now + interval / 2).min(now + interval);
         // A full channel means the encoder is still busy with the last frame: skip this one.
-        let _ = self.tx.try_send(Snapshot::new(img, self.scale, detections));
+        let _ = self.tx.try_send(Snapshot::new(img, scale.max(1), detections));
     }
 }
 
@@ -125,19 +137,13 @@ fn downscale(img: &ImageView, scale: usize) -> (Vec<u8>, usize, usize) {
 }
 
 /// Encode snapshots until the vision thread drops its [`Tap`].
-fn encode_loop(
-    rx: Receiver<Snapshot>,
-    out: watch::Sender<Jpeg>,
-    settings: watch::Receiver<Settings>,
-    quality: u8,
-    overlay: bool,
-) {
+fn encode_loop(rx: Receiver<Snapshot>, out: watch::Sender<Jpeg>, settings: watch::Receiver<Settings>) {
     let mut buf = Vec::new();
     let mut look = Look::default();
     while let Ok(mut snap) = rx.recv() {
-        let (auto_levels, gamma) = {
+        let (auto_levels, gamma, quality, overlay) = {
             let s = settings.borrow();
-            (s.stream_auto_levels, s.stream_gamma)
+            (s.stream_auto_levels, s.stream_gamma, s.stream_quality.clamp(1, 100), s.stream_overlay)
         };
         look.apply(&mut snap.gray, auto_levels, gamma);
         if overlay {
@@ -318,6 +324,7 @@ pub struct Server {
     listener: std::net::TcpListener,
     frames: watch::Receiver<Jpeg>,
     clients: Arc<AtomicUsize>,
+    config: Option<ConfigPage>,
 }
 
 const BOUNDARY: &str = "sonomaframe";
@@ -341,9 +348,9 @@ impl Server {
                     continue;
                 }
             };
-            let (frames, clients) = (self.frames.clone(), self.clients.clone());
+            let (frames, clients, config) = (self.frames.clone(), self.clients.clone(), self.config.clone());
             tokio::spawn(async move {
-                if let Err(e) = serve_client(sock, frames, clients).await {
+                if let Err(e) = serve_client(sock, frames, clients, config).await {
                     debug!("stream client {peer}: {e}");
                 }
             });
@@ -367,15 +374,20 @@ impl Drop for ClientGuard {
     }
 }
 
+#[derive(Debug, PartialEq)]
 enum Route {
     Stream,
     Snapshot,
+    /// The configuration in effect; as a file to save with `download`.
+    Config {
+        download: bool,
+    },
     NotFound,
     BadMethod,
 }
 
 /// Route an HTTP request line: `GET /`, `/?action=stream`, `/stream.mjpg` stream; `?action=snapshot`
-/// sends one frame.
+/// sends one frame; `/config.toml` the configuration.
 fn route(request_line: &str) -> Route {
     let mut parts = request_line.split_whitespace();
     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
@@ -383,21 +395,47 @@ fn route(request_line: &str) -> Route {
         return Route::BadMethod;
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    if path != "/" && path != "/stream.mjpg" {
-        return Route::NotFound;
+    let has =
+        |key: &str| query.split('&').any(|kv| kv == key || kv.strip_prefix(key).is_some_and(|r| r.starts_with('=')));
+    match path {
+        "/config.toml" => Route::Config { download: has("download") },
+        "/" | "/stream.mjpg" if query.split('&').any(|kv| kv == "action=snapshot") => Route::Snapshot,
+        "/" | "/stream.mjpg" => Route::Stream,
+        _ => Route::NotFound,
     }
-    if query.split('&').any(|kv| kv == "action=snapshot") { Route::Snapshot } else { Route::Stream }
 }
 
-async fn serve_client(mut sock: TcpStream, mut frames: watch::Receiver<Jpeg>, clients: Arc<AtomicUsize>) -> Result<()> {
+async fn serve_client(
+    mut sock: TcpStream,
+    mut frames: watch::Receiver<Jpeg>,
+    clients: Arc<AtomicUsize>,
+    config: Option<ConfigPage>,
+) -> Result<()> {
     sock.set_nodelay(true)?;
     let request_line = tokio::time::timeout(Duration::from_secs(5), read_request_line(&mut sock))
         .await
         .context("request timed out")??;
     let route = route(&request_line);
+    if let (Route::Config { download }, Some(page)) = (&route, &config) {
+        let body = (page.render)();
+        // Shown in a browser as text; saved under the camera's name with `?download`.
+        let kind = if *download {
+            format!("application/toml\r\nContent-Disposition: attachment; filename=\"{}\"", page.filename)
+        } else {
+            "text/plain; charset=utf-8".to_string()
+        };
+        let head = format!(
+            "HTTP/1.0 200 OK\r\nConnection: close\r\nCache-Control: no-store\r\nContent-Type: {kind}\r\n\
+             Content-Length: {}\r\n\r\n",
+            body.len()
+        );
+        sock.write_all(head.as_bytes()).await?;
+        sock.write_all(body.as_bytes()).await?;
+        return Ok(());
+    }
     let status = match route {
         Route::Stream | Route::Snapshot => None,
-        Route::NotFound => Some("404 Not Found"),
+        Route::Config { .. } | Route::NotFound => Some("404 Not Found"),
         Route::BadMethod => Some("405 Method Not Allowed"),
     };
     if let Some(status) = status {
@@ -487,6 +525,12 @@ pub fn stream_urls(port: u16) -> Vec<String> {
     local_ipv4().iter().map(|ip| format!("mjpg:http://{ip}:{port}/?action=stream")).collect()
 }
 
+/// The configuration page's URL on this machine's first address (loopback only if there's no other).
+pub fn config_url(port: u16) -> String {
+    let ip = local_ipv4().first().copied().unwrap_or(Ipv4Addr::LOCALHOST);
+    format!("http://{ip}:{port}/config.toml")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +578,10 @@ mod tests {
         assert!(matches!(route("GET /?action=snapshot HTTP/1.1"), Route::Snapshot));
         assert!(matches!(route("GET /favicon.ico HTTP/1.1"), Route::NotFound));
         assert!(matches!(route("POST / HTTP/1.1"), Route::BadMethod));
+        assert_eq!(route("GET /config.toml HTTP/1.1"), Route::Config { download: false });
+        assert_eq!(route("GET /config.toml?download HTTP/1.1"), Route::Config { download: true });
+        assert_eq!(route("GET /config.toml?download=1 HTTP/1.1"), Route::Config { download: true });
+        assert_eq!(route("GET /config.toml?downloads HTTP/1.1"), Route::Config { download: false });
     }
 
     #[test]

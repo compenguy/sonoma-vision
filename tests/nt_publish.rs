@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use nalgebra::{Isometry3, Translation3, UnitQuaternion};
 use rmpv::Value;
+use sonoma_vision::capture::{CameraState, Layout, Mode};
 use sonoma_vision::clock::monotonic_now;
 use sonoma_vision::detector::Detection;
 use sonoma_vision::nt::{self, CameraAdvert, FrameResult, NtConfig};
@@ -90,20 +91,20 @@ async fn publishes_frames_with_server_capture_time() {
     tokio::spawn(fake_server(listener, vtx));
 
     let (tx, rx) = watch::channel(None);
+    // A 640x480 camera at 30 fps, streamed at half size and 15 fps.
+    let mode = Mode { width: 640, height: 480, fps: 30, layout: Layout::Mjpeg };
+    let (_state, state) = watch::channel(CameraState { modes: vec![mode], active: Some(mode), default: Some(mode) });
     let cfg = NtConfig {
         server: nt::parse_server("127.0.0.1").unwrap(),
         port,
         client_name: "test".into(),
         table: "/sonoma/test".into(),
-        camera: Some(CameraAdvert {
-            name: "test-cam".into(),
-            port: 1190,
-            source: "usb:/dev/video9".into(),
-            mode: "320x240 MJPEG 15 fps".into(),
-        }),
+        camera: Some(CameraAdvert { name: "test-cam".into(), port: 1190, source: "usb:/dev/video9".into() }),
         field_layouts: vec![],
+        camera_state: state,
     };
-    let (settings, _) = watch::channel(sonoma_vision::settings::Settings::default());
+    let (settings, _) =
+        watch::channel(sonoma_vision::settings::Settings { stream_scale: 2, stream_fps: 15.0, ..Default::default() });
     let client = tokio::spawn(nt::run(cfg, rx, settings));
 
     let det = Detection {

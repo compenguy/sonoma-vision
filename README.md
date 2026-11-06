@@ -135,24 +135,51 @@ distance and orientations within a degree (`tests/pose.rs`).
 
 These can be changed while running, from a dashboard or the robot program, under `<table>/settings/`:
 
-| Topic | Type | Command line | |
+| Topic | Type | Option | |
 | --- | --- | --- | --- |
 | `exposure` | int | `--exposure` | Manual exposure in driver units (100 µs for UVC cameras); -1 for auto |
 | `gain` | int | `--gain` | Analog gain in driver units; -1 leaves the camera's own |
+| `focus` | int | `--focus` | Manual focus in driver units; -1 for autofocus |
 | `min_contrast` | int | `--min-contrast` | Grey levels required between tag black and white (1-255) |
+| `min_tag_px` | int | `--min-tag-px` | Smallest tag side to guarantee, in pixels (8-30000); smaller is slower |
+| `max_hamming` | int | `--max-hamming` | Payload bits to correct (0-3); -1 for the family's recommendation |
+| `min_border_cells` | int | `--min-border-cells` | Dark border cells required, out of 28 (0-28) |
+| `sharpening` | double | `--sharpening` | Cell sharpening for blurred tags (0-1) |
+| `max_ambiguity` | double | `--max-ambiguity` | Single-tag robot poses more ambiguous than this aren't published (0-1) |
+| `robot_to_camera` | double[6] | `--robot-to-camera` | The camera's pose on the robot: x, y, z (m), roll, pitch, yaw (degrees) |
 | `stream_auto_levels` | boolean | `--stream-auto-levels` | Stretch the stream to the full grey range (default true) |
 | `stream_gamma` | double | `--stream-gamma` | Stream gamma, 0.1-10; above 1 lifts shadows (default 1) |
+| `stream_overlay` | boolean | `--stream-overlay` | Draw detected tags on the stream |
+| `stream_quality` | int | `--stream-quality` | The stream's JPEG quality (1-100) |
+| `stream_fps` | double | `--stream-fps` | Most frames per second to stream (0.1-1000) |
+| `stream_scale` | int | `--stream-scale` | Divide the stream's size by this (1-8) |
 | `field_layout/` | String Chooser | `--field-layout` | The field layout poses are solved against, or `none` |
+| `capture_mode/` | String Chooser | `--width`, `--height`, `--fps`, `--format` | The camera's mode, e.g. `1280x720 MJPG 120fps` |
 
-`field_layout/` is laid out like WPILib's `SendableChooser`, so Elastic and Shuffleboard show it as a
-drop-down: `options` (string[]) lists the layouts found plus `none`, `default` is the command line's,
-`active` is the one in use, and writing a name to `selected` switches to it. Only `selected` is
-persistent.
+The choosers are laid out like WPILib's `SendableChooser`, so Elastic and Shuffleboard show them as
+drop-downs: `options` (string[]), `default` (the configuration's), `active` (the one in use), and
+`selected`, which switches when written. `field_layout/options` lists the layouts found plus `none`.
+`capture_mode/options` lists the modes the camera offers in formats the detector reads (logged at
+startup as `capture modes:`); choosing one reopens the camera, with a gap of about half a second, and
+`active` follows once it's streaming. An empty `capture_mode/selected` means the configuration's mode.
+Only `selected` is persistent. The stream's advertised mode follows the capture mode and the stream
+settings.
 
 They're persistent topics, so the robot's NT server saves them across restarts. **Values the server
-already has win over the command line's**: the command line only sets settings the server doesn't
-have yet. To start over from the command line, delete the topics on the server (in OutlineViewer,
+already has win over the command line's and the configuration file's**: those only set settings the
+server doesn't have yet. To start over from the command line, delete the topics on the server (in OutlineViewer,
 for example). Invalid values are logged and ignored.
+
+With the camera stream on, its server also serves the configuration in effect at
+`http://<controller>:<stream port>/config.toml` (also published as `<table>/config_url`): the
+configuration the service started with, plus the settings changed live. In a browser it's shown as
+text; `/config.toml?download` saves it as `<camera>.toml` (from the table's last part, e.g.
+`cam0.toml`). It's a complete `sonoma-vision.toml`, the shared file's values included, so installing it
+as `/etc/sonoma-vision/cam0.toml` and restarting keeps the changes:
+
+```sh
+curl -o cam0.toml http://10.95.67.2:1190/config.toml
+```
 
 Exposure and gain change what the camera captures, so they affect detection. The stream settings
 are for viewing only. For detection in dim light, raise gain (or exposure, at the cost of motion blur)
@@ -204,8 +231,43 @@ cargo build --release
 ```
 
 `--help` lists every option: `--format`, `--fps`, `--exposure` (manual exposure limits motion blur),
-`--family`, `--min-tag-px`, `--nt-server` (`local`, a team number, or an IPv4 address), `--table`,
-and the `--stream` options above.
+`--focus` (fixed focus, for calibrated poses), `--family`, `--min-tag-px`, `--nt-server` (`local`, a
+team number, or an IPv4 address), `--table`, `--log-level`, and the `--stream` options above.
+
+### Configuration file
+
+Options can also be set in a `sonoma-vision.toml`. Each option is a key in its section, named without
+the section's prefix (`--stream-port` is `port` in `[stream]`, `--nt-server` is `server` in `[nt]`, and
+`--stream` itself is `enabled`):
+
+```toml
+[camera]
+device = "/dev/v4l/by-id/usb-Generic_USB_Camera_0001-video-index0"
+width = 1280
+height = 720
+fps = 120
+
+[stream]
+enabled = true
+
+[pose]
+calibration = "cam0-calibration.json"    # relative paths are relative to this file
+robot_to_camera = [0.3, 0.0, 0.5, 0.0, -15.0, 0.0]
+```
+
+Without `--config`, `sonoma-vision.toml` is read from each of `/usr/share/sonoma-vision`,
+`/usr/local/share/sonoma-vision`, the working directory and the executable's directory that has one
+(where field layouts are looked for), a later directory's value for a key winning. `--config <file>`
+reads only the files given, in order, a later file's value for a key winning: repeat it to layer a
+camera's file over a shared one. Priority, lowest first: built-in defaults, the files, the command
+line, then live settings persisted on the NT server. Unknown keys and invalid values are errors.
+Configuration doesn't come from environment variables; the log level is `--log-level` (or `[log]
+level`), which takes an env_logger filter such as `info,sonoma_vision::nt=debug`.
+
+`--print-config` writes the configuration in effect, the files' values with the command line's
+over them, to stdout as a `sonoma-vision.toml`: every key with its description, those at their
+built-in default commented out. `--stream` and `--stream-overlay` take an optional value, so
+`--stream=false` turns off a stream the file turns on.
 
 Building needs libclang (v4l2r generates its V4L2 bindings with bindgen) and a C compiler, for
 napa-vision's core.
@@ -214,13 +276,16 @@ napa-vision's core.
 
 `tools/build-systemcore.sh` cross-compiles for aarch64. It needs `gcc-aarch64-linux-gnu` and
 `libc6-dev-arm64-cross` (see the script). The binary needs glibc 2.35 or newer. Then copy the binary to
-`/usr/local/bin/`, the field layouts to `/usr/local/share/sonoma-vision/fields/`, the unit to `/etc/systemd/system/`, and a config per camera:
+`/usr/local/bin/`, the field layouts to `/usr/local/share/sonoma-vision/fields/`, the unit to `/etc/systemd/system/`, and the configuration to
+`/etc/sonoma-vision/`: `sonoma-vision.toml` with the settings every camera shares, and a file per
+camera (`cam0.toml`, with its device, table, stream port, calibration and pose on the robot) that the
+unit reads after it:
 
 ```sh
 sudo install -m 755 sonoma-vision /usr/local/bin/
 sudo install -D -m 644 -t /usr/local/share/sonoma-vision/fields fields/*.json
 sudo install -m 644 deploy/sonoma-vision@.service /etc/systemd/system/
-sudo install -D -m 644 deploy/cam0.env /etc/sonoma-vision/cam0.env
+sudo install -D -m 644 -t /etc/sonoma-vision deploy/sonoma-vision.toml deploy/cam0.toml
 sudo systemctl daemon-reload && sudo systemctl enable --now sonoma-vision@cam0
 ```
 

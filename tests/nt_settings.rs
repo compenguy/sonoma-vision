@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use rmpv::Value;
 use serde_json::json;
+use sonoma_vision::capture::{CameraState, Layout, Mode};
 use sonoma_vision::nt::{self, NtConfig};
-use sonoma_vision::settings::Settings;
+use sonoma_vision::settings::{Key, Settings};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
@@ -27,6 +28,8 @@ fn binary(id: i64, value: Value) -> Message {
         Value::Boolean(_) => 0,
         Value::F64(_) => 1,
         Value::String(_) => 4,
+        // double[] (the only array setting here)
+        Value::Array(_) => 17,
         _ => 2,
     };
     let mut buf = Vec::new();
@@ -147,6 +150,10 @@ async fn settings_adopt_persisted_values_publish_the_rest_and_follow_edits() {
     tokio::spawn(fake_server(listener, persisted, seen_tx, edits));
 
     let (_results_tx, results) = watch::channel(None);
+    let fast = Mode { width: 640, height: 480, fps: 120, layout: Layout::Mjpeg };
+    let wide = Mode { width: 1280, height: 720, fps: 60, layout: Layout::Mjpeg };
+    let (state_tx, state) =
+        watch::channel(CameraState { modes: vec![wide, fast], active: Some(wide), default: Some(wide) });
     let (settings_tx, mut settings) =
         watch::channel(Settings { exposure: Some(50), field_layout: Some("a".into()), ..Settings::default() });
     let cfg = NtConfig {
@@ -156,6 +163,7 @@ async fn settings_adopt_persisted_values_publish_the_rest_and_follow_edits() {
         table: "/sonoma/test".into(),
         camera: None,
         field_layouts: vec!["a".into(), "b".into()],
+        camera_state: state,
     };
     tokio::spawn(nt::run(cfg, results, settings_tx));
 
@@ -168,11 +176,13 @@ async fn settings_adopt_persisted_values_publish_the_rest_and_follow_edits() {
     let mut values = HashMap::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     let chooser = "/sonoma/test/settings/field_layout/";
-    let wanted = ["exposure", "min_contrast", "stream_auto_levels", "stream_gamma"];
+    let wanted = Key::ALL.map(Key::name).into_iter().filter(|k| *k != "gain").collect::<Vec<_>>();
     let chooser_wanted = [".type", "options", "default", "active"];
     let have_all = |v: &HashMap<String, Value>| {
         wanted.iter().all(|k| v.contains_key(*k))
             && chooser_wanted.iter().all(|k| v.contains_key(&format!("field_layout/{k}")))
+            && chooser_wanted.iter().all(|k| v.contains_key(&format!("capture_mode/{k}")))
+            && v.contains_key("capture_mode/selected")
     };
     while !have_all(&values) {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -187,10 +197,21 @@ async fn settings_adopt_persisted_values_publish_the_rest_and_follow_edits() {
             }
         }
     }
-    for key in ["exposure", "gain", "min_contrast", "stream_auto_levels", "stream_gamma"] {
+    for key in Key::ALL.map(Key::name) {
         let props = &published[&format!("/sonoma/test/settings/{key}")];
         assert_eq!(props["persistent"], true, "{key}: {props}");
     }
+    assert_eq!(values["robot_to_camera"], Value::Array(vec![Value::from(0.0); 6]));
+    assert_eq!(values["max_hamming"], Value::from(-1), "the family's recommendation");
+    // The capture mode chooser lists the camera's modes; empty `selected` means the configuration's.
+    assert_eq!(
+        values["capture_mode/options"],
+        Value::Array(vec!["1280x720 MJPG 60fps".into(), "640x480 MJPG 120fps".into()])
+    );
+    assert_eq!(values["capture_mode/default"], Value::from("1280x720 MJPG 60fps"));
+    assert_eq!(values["capture_mode/active"], Value::from("1280x720 MJPG 60fps"));
+    assert_eq!(values["capture_mode/selected"], Value::from(""));
+    assert_eq!(published["/sonoma/test/settings/capture_mode/selected"]["persistent"], true);
     assert_eq!(values["exposure"], Value::from(50));
     assert_eq!(values["min_contrast"], Value::from(20));
     assert_eq!(values["stream_auto_levels"], Value::from(true));
@@ -211,6 +232,26 @@ async fn settings_adopt_persisted_values_publish_the_rest_and_follow_edits() {
     assert_eq!(settings.borrow().stream_gamma, 1.0);
     edit.send(("/sonoma/test/settings/exposure".into(), Value::from(-1))).unwrap();
     wait_for(&mut settings, "auto exposure", |s| s.exposure.is_none()).await;
+    let mount = Value::Array([0.3, 0.0, 0.5, 0.0, -15.0, 0.0].map(Value::from).to_vec());
+    edit.send(("/sonoma/test/settings/robot_to_camera".into(), mount)).unwrap();
+    wait_for(&mut settings, "the mount", |s| s.robot_to_camera.0[4] == -15.0).await;
+
+    // Choosing a capture mode sets it; `active` follows the camera once it has reopened.
+    edit.send(("/sonoma/test/settings/capture_mode/selected".into(), Value::from("640x480 MJPG 120fps"))).unwrap();
+    wait_for(&mut settings, "the capture mode", |s| s.capture_mode == Some(fast)).await;
+    state_tx.send_modify(|s| s.active = Some(fast));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let msg =
+            tokio::time::timeout(remaining, seen.recv()).await.expect("capture mode active wasn't updated").unwrap();
+        if let Seen::Value(name, v) = msg
+            && name == "/sonoma/test/settings/capture_mode/active"
+            && v == Value::from("640x480 MJPG 120fps")
+        {
+            break;
+        }
+    }
 
     // Selecting a layout that isn't there is ignored (`active` stays b); `none` turns poses off, and
     // `active` follows.

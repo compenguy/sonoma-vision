@@ -14,18 +14,10 @@ use log::{debug, info, warn};
 use nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 use serde_json::Value;
 
-/// Where named layouts are looked for, in order: the system and local share directories, `fields`
-/// in the working directory, then `fields` beside the executable.
+/// Where named layouts are looked for, in order: `fields` in each of [`crate::config::search_dirs`] (the
+/// system and local share directories, the working directory, then the executable's directory).
 pub fn search_dirs() -> Vec<PathBuf> {
-    let mut dirs =
-        vec![PathBuf::from("/usr/share/sonoma-vision/fields"), PathBuf::from("/usr/local/share/sonoma-vision/fields")];
-    if let Ok(cwd) = std::env::current_dir() {
-        dirs.push(cwd.join("fields"));
-    }
-    if let Some(dir) = std::env::current_exe().ok().as_deref().and_then(Path::parent) {
-        dirs.push(dir.join("fields"));
-    }
-    dirs
+    crate::config::search_dirs().into_iter().map(|d| d.join("fields")).collect()
 }
 
 /// The named layouts found in a set of directories.
