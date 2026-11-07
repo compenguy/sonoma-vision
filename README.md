@@ -12,6 +12,47 @@ This absolutely would not be possible without Zachary Wilson's brilliant work on
 skips regions without contrast, groups dark runs into blobs, rejects non-tags with a cheap early
 decode, and fits edges and decodes only the tags, at full resolution.
 
+## Compared with napa-vision
+
+napa-vision is a library: give it a frame, and it returns tags, and poses if you also give it a
+calibration. sonoma-vision uses the same detector, so detections are identical. What it adds is a
+running service for an FRC robot, built around that detector.
+
+**sonoma-vision only:**
+
+- **Camera capture (V4L2).** The camera driver's buffers are read in place. The format is chosen so the
+  detector reads it without a copy where possible, and checked against the camera's sizes and frame rates.
+  Each read takes the newest frame, so a slow frame never builds a backlog.
+- **Capture timestamps on the robot's clock.** The driver's capture time is mapped onto the NT server's
+  clock through NT4 time sync, ready for `addVisionMeasurement`.
+- **NetworkTables 4 publishing.** An atomic per-frame record, `robot_pose` (Pose3d) and `camera_to_tag`
+  (Transform3d) as WPILib structs, a Field2d, and per-tag topics for dashboards.
+- **Live settings over NT.** Detection, exposure, gain, focus, stream and mounting settings, plus
+  drop-downs for the field layout and the camera mode. The server keeps them across restarts, and
+  `/config.toml` saves them to a file.
+- **A CameraServer-compatible MJPEG stream,** with tag overlays. Elastic finds it, and it costs
+  nothing while no one is watching.
+- **FRC inputs:** WPILib field layout JSON, PhotonVision calibration exports, and the camera's pose on
+  the robot.
+- **Deployment.** One native binary needing only glibc 2.35, with layered toml configuration, a
+  per-camera systemd unit, and release bundles for SystemCore.
+
+**napa-vision only:**
+
+- **Pose uncertainty.** Every pose carries a 6×6 covariance computed from that frame's geometry, and
+  `local_std_devs()` gives the standard deviations `addVisionMeasurement` takes. sonoma-vision
+  publishes poses without any uncertainty.
+- **Multi-tag robustness.** A RANSAC fallback when three or more tags disagree, outlier rejection with a
+  reason recorded per tag, bounds on where the camera can physically be, and ambiguous single-tag poses
+  down-weighted rather than dropped.
+- **Tag bearings with covariances,** for aiming at a tag rather than localizing.
+- **Stereo:** one pose from two calibrated cameras.
+- **Tools:** camera calibration from checkerboard photos (`napa-calibrate`), printable tags
+  (`napa-tag`), scoring on your own labeled footage (`napa-benchmark`), and a drop-in replacement for
+  `pupil_apriltags`.
+- **Other platforms:** Python wheels for Windows, macOS and Android, and a C library for Android and
+  Meta Quest.
+
 ## License
 
 sonoma-vision's own code is under your choice of the [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)
