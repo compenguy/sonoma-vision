@@ -94,6 +94,10 @@ const VARIANCE_SLACK: f64 = 0.1;
 /// can't all be where the layout says, or the camera model is off.
 const MISFIT_PROBABILITY: f64 = 1e-4;
 
+/// A tag joins a group when its corners are no farther from where the group's pose predicts them
+/// than corner noise would leave them this rarely.
+const AGREEMENT_PROBABILITY: f64 = 1e-3;
+
 /// The χ² value with even `dof` degrees of freedom that's exceeded with probability `p`: where
 /// `e^(-x/2) Σ_{i<dof/2} (x/2)^i / i!` falls to `p`.
 fn chi2_exceeded(dof: usize, p: f64) -> f64 {
@@ -206,7 +210,16 @@ pub struct FieldPose {
     /// The standard deviations of x and y along the robot's forward and left axes, and of yaw (radians),
     /// for WPILib's `addVisionMeasurement`.
     pub std_devs: [f64; 3],
+    /// Tags in view and in the layout that disagreed with the rest, and were left out: each tag's ID
+    /// and why.
+    pub outliers: Vec<Outlier>,
 }
+
+/// A tag left out of a pose: its ID, and why.
+pub type Outlier = (u32, String);
+
+/// A tag's corners on the field, and where they were seen: normalised, and in pixels.
+type TagPoints = (Vec<Vector3<f64>>, Vec<[f64; 2]>, Vec<[f64; 2]>);
 
 /// A detection whose tag is in the layout: the detection, its pose relative to the camera, and the
 /// tag's pose on the field.
@@ -301,7 +314,9 @@ impl Estimator {
     /// Every tag is fitted jointly over every corner: each tag's two solutions seed the fit, and so
     /// does the wall's when the tags are on one wall. The distinct fits that leave the robot within
     /// [`PoseBounds`] are the candidates. The best is the pose, and the valleys through each widen its
-    /// covariance as far as they fit.
+    /// covariance as far as they fit. When several tags don't fit together (or leave no pose within the bounds), the
+    /// largest group that agree is fitted instead, and the rest are left
+    /// out as [`FieldPose::outliers`].
     pub fn field(&self, detections: &[Detection], tags: &[Option<TagPose>]) -> Result<Option<FieldPose>, String> {
         let Some(layout) = self.cfg.layout.as_ref() else { return Ok(None) };
         let known: Vec<Known> =
@@ -309,7 +324,104 @@ impl Estimator {
         if known.is_empty() {
             return Ok(None);
         }
-        self.solve_tags(&known, layout).map(Some)
+        // Every tag, unless they don't fit together: then the largest group that agree.
+        let failure = match self.solve_tags(&known, layout) {
+            Ok(pose) => return Ok(Some(pose)),
+            Err(why) if known.len() == 1 => return Err(why),
+            Err(why) => why,
+        };
+        let (inliers, outliers) = self.consensus(&known)?;
+        if outliers.is_empty() {
+            return Err(failure);
+        }
+        let mut pose = self.solve_tags(&inliers, layout)?;
+        pose.outliers = outliers;
+        Ok(Some(pose))
+    }
+
+    /// The largest group of `known` that agree on where the camera is, and the rest, each with why
+    /// it was left out. Each tag's two solutions are a hypothesis; the tags
+    /// whose corners are where the hypothesis predicts, allowing for its uncertainty
+    /// ([`solve::prediction_distance`]), join it, and the group is refitted and tested again until it
+    /// settles. Err when no two tags agree, or when two groups of the same size disagree: then
+    /// there's no telling which tags are where the layout says.
+    /// Membership is all this decides: [`Self::solve_tags`] fits the group and applies the bounds.
+    fn consensus<'a>(&self, known: &[Known<'a>]) -> Result<(Vec<Known<'a>>, Vec<Outlier>), String> {
+        let corners = tag_corners(self.cfg.tag_size);
+        let variance = self.cfg.corner_noise_px.powi(2);
+        let optical = rotation(wpilib_from_optical().inverse());
+        // Each detection's corners on the field, and where they were seen (normalised, and in pixels).
+        let points: Vec<TagPoints> = known
+            .iter()
+            .map(|(d, _, field_tag)| {
+                let world = corners.iter().map(|c| (*field_tag * Point3::from(*c)).coords).collect();
+                (world, d.corners.iter().map(|&p| self.camera.normalize(p)).collect(), d.corners.to_vec())
+            })
+            .collect();
+        let gather = |members: &[usize]| {
+            let world: Vec<Vector3<f64>> = members.iter().flat_map(|&i| points[i].0.clone()).collect();
+            let obs: Vec<[f64; 2]> = members.iter().flat_map(|&i| points[i].1.clone()).collect();
+            (world, obs)
+        };
+        let agrees = |i: usize, pose: &Isometry3<f64>, info: &Matrix6<f64>| {
+            let (world, obs, _) = &points[i];
+            solve::prediction_distance(pose, info, world, obs, self.camera.fx, self.camera.fy, variance)
+                .is_some_and(|d| d < chi2_exceeded(2 * world.len(), AGREEMENT_PROBABILITY))
+        };
+        // Each hypothesis's group, its fitted pose and the group's squared error.
+        let mut groups: Vec<(Vec<usize>, Isometry3<f64>, f64)> = Vec::new();
+        for (h, (_, t, field_tag)) in known.iter().enumerate() {
+            for camera_to_tag in std::iter::once(t.camera_to_tag).chain(t.alternate) {
+                let mut pose = optical * (*field_tag * camera_to_tag.inverse()).inverse();
+                let mut members = vec![h];
+                for _ in 0..4 {
+                    let (world, obs) = gather(&members);
+                    if members.len() > 1 && solve::refine(&mut pose, &world, &obs).is_none() {
+                        break;
+                    }
+                    let info = solve::information(&pose, &world, self.camera.fx, self.camera.fy) / variance;
+                    let grown: Vec<usize> = (0..known.len()).filter(|&i| i == h || agrees(i, &pose, &info)).collect();
+                    if grown == members {
+                        break;
+                    }
+                    members = grown;
+                }
+                let (world, obs) = gather(&members);
+                if solve::refine(&mut pose, &world, &obs).is_none() {
+                    continue;
+                }
+                let pixels: Vec<[f64; 2]> = members.iter().flat_map(|&i| points[i].2.clone()).collect();
+                groups.push((members, pose, self.squared_error(&pose, &world, &pixels)));
+            }
+        }
+        let ids = |members: &[usize]| members.iter().map(|&i| known[i].0.id).collect::<Vec<u32>>();
+        let all: Vec<usize> = (0..known.len()).collect();
+        groups.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.2.total_cmp(&b.2)));
+        let Some((best, pose, _)) = groups.first() else {
+            return Err(format!("tags {:?}: no fit", ids(&all)));
+        };
+        if best.len() < 2 {
+            return Err(format!("tags {:?} disagree on the pose, and can't all be where the layout says", ids(&all)));
+        }
+        if let Some((rival, _, _)) =
+            groups.iter().find(|(g, _, _)| g.len() == best.len() && g.iter().all(|i| !best.contains(i)))
+        {
+            return Err(format!(
+                "tags {:?} and {:?} disagree on the pose; no telling which are where the layout says",
+                ids(best),
+                ids(rival)
+            ));
+        }
+        let outliers = all
+            .iter()
+            .filter(|i| !best.contains(i))
+            .map(|&i| {
+                let (world, _, pixels) = &points[i];
+                let rms = self.error_px(pose, world, pixels);
+                (known[i].0.id, format!("{rms:.1} px RMS off the pose tags {:?} give", ids(best)))
+            })
+            .collect();
+        Ok((best.iter().map(|&i| known[i]).collect(), outliers))
     }
 
     /// The robot's pose from `known`, fitted jointly over every corner (see [`Self::field`]).
@@ -430,6 +542,7 @@ impl Estimator {
             ambiguity,
             covariance,
             std_devs: pose2d.local_std_devs(),
+            outliers: Vec::new(),
         })
     }
 
@@ -624,11 +737,14 @@ mod tests {
         // Tags not in the layout don't count.
         assert_eq!(est.field(&[detection(99, seen[0].corners)], &poses[..1]), Ok(None));
 
-        // A corner 15 px from where the rest put it: no pose fits that well enough to publish.
+        // A corner 15 px from where the rest put it. With two tags, they disagree, and there's no
+        // telling which is right; alone, no pose fits that tag well enough to publish.
         let mut bent = seen.clone();
         bent[0].corners[0][0] += 15.0;
         let bent_poses: Vec<Option<TagPose>> = bent.iter().map(|d| est.tag(d)).collect();
         let why = est.field(&bent, &bent_poses).unwrap_err();
+        assert!(why.contains("disagree"), "{why}");
+        let why = est.field(&bent[..1], &bent_poses[..1]).unwrap_err();
         assert!(why.contains("corners fit"), "{why}");
 
         // A robot that can't be off the floor at all: the pose is dropped, and says why.

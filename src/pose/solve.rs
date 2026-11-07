@@ -5,7 +5,8 @@
 //! [`super::camera::Intrinsics::normalize`]).
 
 use nalgebra::{
-    Isometry3, Matrix2, Matrix3, Matrix6, Rotation3, SMatrix, SVector, Translation3, UnitQuaternion, Vector3, Vector6,
+    DMatrix, DVector, Isometry3, Matrix2, Matrix3, Matrix6, Rotation3, SMatrix, SVector, Translation3, UnitQuaternion,
+    Vector3, Vector6,
 };
 
 /// The homography taking plane points `(x, y)` (z = 0) to normalised image points, from four or more
@@ -131,6 +132,42 @@ pub fn information(pose: &Isometry3<f64>, world: &[Vector3<f64>], fx: f64, fy: f
 /// Returns the final cost, or None if the starting pose puts a point behind the camera.
 pub fn refine(pose: &mut Isometry3<f64>, world: &[Vector3<f64>], obs: &[[f64; 2]]) -> Option<f64> {
     refine_in(pose, world, obs, &Matrix6::identity())
+}
+
+/// How far the observations of `world` points are from where `pose` predicts them, as a squared
+/// Mahalanobis distance: χ² with two degrees of freedom per point if they're consistent. The
+/// prediction's uncertainty counts both each coordinate's noise (`variance`, pixels², at focal
+/// lengths `fx`, `fy`) and the pose's own, from `info`, the information the pose was fitted with
+/// (as [`information`]'s, divided by the noise's variance). A pose from one distant tag predicts other
+/// tags only loosely, and this allows for that. None if the pose puts a point behind the camera.
+pub fn prediction_distance(
+    pose: &Isometry3<f64>,
+    info: &Matrix6<f64>,
+    world: &[Vector3<f64>],
+    obs: &[[f64; 2]],
+    fx: f64,
+    fy: f64,
+    variance: f64,
+) -> Option<f64> {
+    let n = 2 * world.len();
+    let p = info.try_inverse()?;
+    let mut jac = DMatrix::<f64>::zeros(n, 6);
+    let mut residual = DVector::<f64>::zeros(n);
+    for (i, (x, &[u, v])) in world.iter().zip(obs).enumerate() {
+        if (pose * nalgebra::Point3::from(*x)).z <= 1e-9 {
+            return None;
+        }
+        let (j, [pu, pv]) = point_jacobian(pose, x);
+        for k in 0..6 {
+            jac[(2 * i, k)] = j[(0, k)] * fx;
+            jac[(2 * i + 1, k)] = j[(1, k)] * fy;
+        }
+        residual[2 * i] = (pu - u) * fx;
+        residual[2 * i + 1] = (pv - v) * fy;
+    }
+    let s = &jac * p * jac.transpose() + DMatrix::<f64>::identity(n, n) * variance;
+    let solved = s.cholesky()?.solve(&residual);
+    Some(residual.dot(&solved))
 }
 
 /// As [`refine`], but holding the pose fixed along `along` (an increment, as [`apply_increment`] takes):

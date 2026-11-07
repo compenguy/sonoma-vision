@@ -40,9 +40,6 @@ running service for an FRC robot, built around that detector.
 
 **napa-vision only:**
 
-- **Multi-tag outlier handling.** A RANSAC fallback when three or more tags disagree, and outlier
-  rejection with a reason recorded per tag. sonoma-vision fits every tag in view together, and rejects
-  the whole pose when its corners fit too poorly.
 - **Covariances for single tags and tag bearings,** for aiming at a tag rather than localizing.
   sonoma-vision publishes uncertainty for the robot's pose only.
 - **Stereo:** one pose from two calibrated cameras.
@@ -116,6 +113,8 @@ Under the table (default `/sonoma/cam0`):
 | `robot_pose_measurement` | double[6] | `[x, y, yaw, std_x, std_y, std_yaw]`: what `addVisionMeasurement` takes, in one value (see Poses) |
 | `robot_pose_covariance` | double[36] | The robot pose's 6×6 covariance, row-major, over x, y, z, rx, ry, rz in the field's axes |
 | `pose_error_px`, `pose_ambiguity` | double | Its RMS reprojection error, and how nearly a second pose fits as well |
+| `pose_outliers` | int[] | Tags left out of `robot_pose` because they disagreed with the rest |
+| `pose_outlier_reasons` | string[] | Why each was left out, in the same order |
 | `pose_rejected` | string | Why tags from the layout were in view but gave no pose; empty while poses are published |
 | `field` | Field2d | The robot's pose for dashboards' field widgets |
 
@@ -193,6 +192,13 @@ field layout selected, no poses are solved at all (tags are still detected and p
   robot.
 - **Fit.** A pose whose corners fit worse than `--corner-noise-px` explains (a 1-in-10,000 chance) isn't
   published: a tag isn't where the layout says, or the calibration is off.
+- **Outliers.** When several tags don't fit together, the largest group that agree on a pose is used,
+  and the rest are left out and listed in `pose_outliers`, with why in `pose_outlier_reasons`. Each
+  tag's two solutions are a hypothesis. The tags whose corners are where a hypothesis predicts them,
+  allowing for that hypothesis's own uncertainty, join it, and the group is refitted until it settles.
+  A lone distant tag predicts the others only loosely, and the test allows for that. With two tags that
+  disagree, or two equal groups that disagree, there's no telling which tags are where the layout says,
+  so no pose is published.
 
 `pose_rejected` says which of these dropped a pose.
 
@@ -236,7 +242,17 @@ of the assumed size, and counts how often the truth falls outside each published
 | Tags at two depths, 3.5-6 m | 5.8 / 3.8 / 4.8% | 0.06 ms |
 
 The times are for every tag's pose and the robot's, on one desktop core. The hardest scene, two small
-tags side by side seen head-on from afar, is the one no Gaussian describes well.
+tags side by side seen head-on from afar, is the one no Gaussian describes well. In none of these
+clean scenes was a tag wrongly left out as an outlier.
+
+With the layout wrong about one tag (the solver told it's elsewhere along the wall), 2.5-5 m away:
+
+| Scene (1 px noise) | Wrong tag left out | Another tag left out | x / y / yaw outside |
+| --- | ---: | ---: | ---: |
+| Four tags, one 0.5 m off | 100% of frames | 0 | 2.7 / 4.0 / 4.0% |
+| Three tags, one 0.5 m off | 99.7% | 0 | 2.7 / 3.3 / 3.3% |
+| Three tags, one 0.15 m off | 99.3% | 2 of 300 frames | 3.7 / 4.7 / 5.0% |
+| Two tags, one 0.5 m off | No pose in 300 of 300 frames | | |
 
 On synthetic frames with an exact camera model, tag positions come back within about 0.02% of the
 distance and orientations within a degree (`tests/pose.rs`).

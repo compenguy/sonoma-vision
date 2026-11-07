@@ -51,18 +51,29 @@ struct Tally {
     outside3: usize,
     axis_outside: [usize; 3],
     rejected: usize,
+    /// Frames with a tag wrongly left out (every tag here is where the layout says).
+    outlier_frames: usize,
     seconds: f64,
 }
 
 impl Tally {
     fn new() -> Self {
-        Self { n: 0, nees6: 0.0, outside6: 0, outside3: 0, axis_outside: [0; 3], rejected: 0, seconds: 0.0 }
+        Self {
+            n: 0,
+            nees6: 0.0,
+            outside6: 0,
+            outside3: 0,
+            axis_outside: [0; 3],
+            rejected: 0,
+            outlier_frames: 0,
+            seconds: 0.0,
+        }
     }
 
     fn report(&self, name: &str) -> String {
         let n = (self.n - self.rejected).max(1) as f64;
         format!(
-            "{name:<28} n {:4}  NEES6 {:6.2}  out95 6D {:5.1}%  3D {:5.1}%  per-axis {:4.1}/{:4.1}/{:4.1}%  rejected {}  {:.3} ms",
+            "{name:<28} n {:4}  NEES6 {:6.2}  out95 6D {:5.1}%  3D {:5.1}%  per-axis {:4.1}/{:4.1}/{:4.1}%  rejected {}  outliers {}  {:.3} ms",
             self.n,
             self.nees6 / n,
             100.0 * self.outside6 as f64 / n,
@@ -71,6 +82,7 @@ impl Tally {
             100.0 * self.axis_outside[1] as f64 / n,
             100.0 * self.axis_outside[2] as f64 / n,
             self.rejected,
+            self.outlier_frames,
             1e3 * self.seconds / self.n.max(1) as f64
         )
     }
@@ -83,13 +95,27 @@ fn run(
     noise_px: f64,
     trials: usize,
     seed: u64,
-    mut place: impl FnMut(&mut Rng) -> Isometry3<f64>,
+    place: impl FnMut(&mut Rng) -> Isometry3<f64>,
 ) -> Tally {
+    run_believing(layout.clone(), layout, noise_px, trials, seed, place).0
+}
+
+/// As [`run`], with the estimator told `believed` while the tags are really where `layout` says.
+/// Also returns, per tag ID, the frames in which exactly that tag was left out as an outlier.
+fn run_believing(
+    believed: FieldLayout,
+    layout: FieldLayout,
+    noise_px: f64,
+    trials: usize,
+    seed: u64,
+    mut place: impl FnMut(&mut Rng) -> Isometry3<f64>,
+) -> (Tally, HashMap<u32, usize>) {
+    let mut caught: HashMap<u32, usize> = HashMap::new();
     let cfg = PoseConfig {
         calibration: None,
         fov_deg: 70.0,
         tag_size: FRC_TAG_SIZE,
-        layout: Some(layout.clone()),
+        layout: Some(believed),
         robot_to_camera: Isometry3::identity(),
         // Every single-tag pose, however ambiguous: its covariance has to cover that.
         max_ambiguity: 1.0,
@@ -146,6 +172,10 @@ fn run(
                 continue;
             }
         };
+        tally.outlier_frames += usize::from(!field.outliers.is_empty());
+        if let [(id, _)] = field.outliers.as_slice() {
+            *caught.entry(*id).or_default() += 1;
+        }
         let d = difference(&field.robot, &camera);
         let nees6 = (d.transpose() * field.covariance.try_inverse().unwrap() * d)[0];
         tally.nees6 += nees6;
@@ -166,7 +196,7 @@ fn run(
             tally.axis_outside[i] += usize::from(err.abs() > 1.96 * s);
         }
     }
-    tally
+    (tally, caught)
 }
 
 /// Where each trial puts the camera.
@@ -235,4 +265,53 @@ fn covariances_cover_the_truth() {
     // standard deviations robot code passes to addVisionMeasurement.
     assert!(worst < 0.12, "6D covariances overconfident:\n{}", lines.join("\n"));
     assert!(worst_axis < 0.12, "standard deviations overconfident:\n{}", lines.join("\n"));
+}
+
+/// A layout that's wrong about one tag (`id`, `moved` metres along the wall): the estimator is
+/// told this one while the frames show the true layout.
+fn moved(layout: &FieldLayout, id: u32, moved: f64) -> FieldLayout {
+    let mut wrong = layout.clone();
+    let tag = wrong.tags.get_mut(&id).unwrap();
+    tag.translation.vector.y += moved;
+    wrong
+}
+
+#[test]
+fn a_misplaced_tag_is_left_out() {
+    let trials = 300;
+    let mut lines = Vec::new();
+    let four = layout(
+        &[(3.4, 1.0), (4.0, 1.4), (4.6, 0.9)],
+        Some(Isometry3::from_parts(
+            Translation3::new(6.5, 4.8, 0.8),
+            UnitQuaternion::from_euler_angles(0.0, 0.0, std::f64::consts::PI * 0.85),
+        )),
+    );
+    let three = layout(&[(3.4, 1.0), (4.0, 1.4), (4.6, 0.9)], None);
+    let two = layout(&[(3.6, 1.0), (4.4, 1.2)], None);
+    let place = |r: &mut Rng| in_front(r, 4.0, 1.1, (2.5, 5.0), 30.0);
+    let mut check = |name: &str, truth: &FieldLayout, wrong: u32, by: f64, expect_caught: f64| {
+        let (t, caught) = run_believing(moved(truth, wrong, by), truth.clone(), 1.0, trials, 7, place);
+        let accepted = (t.n - t.rejected).max(1) as f64;
+        let rate = *caught.get(&wrong).unwrap_or(&0) as f64 / t.n as f64;
+        let others: usize = caught.iter().filter(|(id, _)| **id != wrong).map(|(_, n)| n).sum();
+        lines.push(format!(
+            "{} | caught tag {wrong} in {:.1}% of frames, another tag in {others}",
+            t.report(name),
+            100.0 * rate
+        ));
+        assert!(rate >= expect_caught, "{name}: tag {wrong} caught in only {:.1}%\n{}", 100.0 * rate, lines.join("\n"));
+        // Left out or not, the published poses stay honest.
+        let worst = t.axis_outside.iter().copied().max().unwrap() as f64 / accepted;
+        assert!(worst < 0.12, "{name}: standard deviations overconfident\n{}", lines.join("\n"));
+        t
+    };
+    check("4 tags, one 0.5 m off", &four, 2, 0.5, 0.95);
+    check("3 tags, one 0.5 m off", &three, 2, 0.5, 0.95);
+    check("3 tags, one 0.15 m off", &three, 3, 0.15, 0.5);
+    // Two tags that disagree: no telling which is wrong, so no pose.
+    let t = check("2 tags, one 0.5 m off", &two, 2, 0.5, 0.0);
+    lines.push(format!("2 tags: {} of {} frames rejected", t.rejected, t.n));
+    println!("{}", lines.join("\n"));
+    assert!(t.rejected as f64 >= 0.95 * t.n as f64, "{}", lines.join("\n"));
 }

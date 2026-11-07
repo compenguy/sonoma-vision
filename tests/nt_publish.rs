@@ -139,6 +139,7 @@ async fn publishes_frames_with_server_capture_time() {
         ambiguity: 0.05,
         covariance,
         std_devs: [0.1, 0.2, 0.03],
+        outliers: vec![(7, "2.0 px RMS off the pose tags [3] give".into())],
     };
     let record_pose = |pose: &mut HashMap<String, Value>, name: &str, v: &Value| {
         if let Some(key) = name.strip_prefix("/sonoma/test/")
@@ -148,6 +149,8 @@ async fn publishes_frames_with_server_capture_time() {
                 "robot_pose_covariance",
                 "pose_tags",
                 "pose_rejected",
+                "pose_outliers",
+                "pose_outlier_reasons",
                 "field/.type",
                 "field/Robot",
             ]
@@ -224,6 +227,8 @@ async fn publishes_frames_with_server_capture_time() {
         "robot_pose_covariance",
         "pose_tags",
         "pose_rejected",
+        "pose_outliers",
+        "pose_outlier_reasons",
         "field/.type",
         "field/Robot",
     ];
@@ -270,6 +275,8 @@ async fn publishes_frames_with_server_capture_time() {
     let cov: Vec<f64> = pose["robot_pose_covariance"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
     assert_eq!((cov.len(), cov[1], cov[6]), (36, 0.5, 0.0));
     assert_eq!(pose["pose_rejected"], Value::from(""));
+    assert_eq!(pose["pose_outliers"], Value::Array(vec![Value::from(7)]));
+    assert_eq!(pose["pose_outlier_reasons"], Value::Array(vec![Value::from("2.0 px RMS off the pose tags [3] give")]));
     assert_eq!(pose["field/.type"], Value::from("Field2d"));
     let robot2d: Vec<f64> = pose["field/Robot"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
     assert!((robot2d[0] - 1.0).abs() < 1e-12 && (robot2d[1] - 2.0).abs() < 1e-12 && (robot2d[2] - 90.0).abs() < 1e-9);

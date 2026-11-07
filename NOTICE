@@ -24,9 +24,9 @@ As NAPA's additional term under section 7(b) of the GPL requires, works based on
 notice and credit Zachary Wilson as NAPA's author in their Appropriate Legal Notices. NAPA is also
 available under a commercial license from Zachary Wilson; ask through https://github.com/zwatx/NAPA.
 
-The pose uncertainty in src/pose (covariances, standard deviations for WPILib's pose estimators,
-pose bounds) was written for sonoma-vision from standard methods, prompted by NAPA's documentation of
-its own. It contains no NAPA code.
+The pose uncertainty and robustness in src/pose (covariances, standard deviations for WPILib's pose
+estimators, pose bounds, multi-tag outlier handling) were written for sonoma-vision from standard
+methods, prompted by NAPA's documentation of its own. They contain no NAPA code.
 
 Other third-party code and data
 

@@ -21,8 +21,10 @@
 //!   yaw, which is what `addVisionMeasurement` takes, in one atomic value), `robot_pose_covariance`
 //!   (`double[36]`, row-major 6×6 over x, y, z, rx, ry, rz in the field's axes), `pose_tags` (int[],
 //!   the tags used), `pose_error_px` and `pose_ambiguity` (double), and `field`, a WPILib Field2d
-//!   (`Robot` is `[x, y, degrees]`) for dashboards' field widgets. When tags were in view but gave no
-//!   trustworthy pose, `pose_rejected` (string) says why; it's empty while poses are published.
+//!   (`Robot` is `[x, y, degrees]`) for dashboards' field widgets. Tags left out of the pose because
+//!   they disagreed with the rest are in `pose_outliers` (int[]), with why in `pose_outlier_reasons`
+//!   (string[], in the same order). When tags were in view but gave no trustworthy pose,
+//!   `pose_rejected` (string) says why; it's empty while poses are published.
 //!
 //! With the camera stream on, it's also advertised as WPILib's CameraServer advertises streams, under
 //! `/CameraPublisher/<name>` (`streams`, `source`, `description`, `connected`, `mode`, `modes`), so
@@ -232,6 +234,8 @@ struct Publishers {
     robot_pose_measurement: Publisher<Vec<f64>>,
     robot_pose_covariance: Publisher<Vec<f64>>,
     pose_rejected: Publisher<String>,
+    pose_outliers: Publisher<Vec<i64>>,
+    pose_outlier_reasons: Publisher<Vec<String>>,
     field_type: Publisher<String>,
     field_robot: Publisher<Vec<f64>>,
 }
@@ -264,6 +268,8 @@ async fn publish_loop(
         robot_pose_measurement: topic("robot_pose_measurement").publish_bypass(Default::default()).await?,
         robot_pose_covariance: topic("robot_pose_covariance").publish_bypass(Default::default()).await?,
         pose_rejected: topic("pose_rejected").publish_bypass(Default::default()).await?,
+        pose_outliers: topic("pose_outliers").publish_bypass(Default::default()).await?,
+        pose_outlier_reasons: topic("pose_outlier_reasons").publish_bypass(Default::default()).await?,
         field_type: topic("field/.type").publish_bypass(Default::default()).await?,
         field_robot: topic("field/Robot").publish_bypass(Default::default()).await?,
     };
@@ -300,6 +306,10 @@ async fn publish_loop(
             // Row-major (nalgebra stores column-major).
             p.robot_pose_covariance.set_at(f.covariance.transpose().as_slice().to_vec(), capture_server).await?;
             p.field_robot.set_at(vec![t.x, t.y, yaw.to_degrees()], capture_server).await?;
+            let (ids, reasons): (Vec<i64>, Vec<String>) =
+                f.outliers.iter().map(|(id, why)| (i64::from(*id), why.clone())).unzip();
+            p.pose_outliers.set_at(ids, capture_server).await?;
+            p.pose_outlier_reasons.set_at(reasons, capture_server).await?;
         }
         match (&r.field_pose, &r.pose_rejected) {
             (Some(_), _) => p.pose_rejected.set_at(String::new(), capture_server).await?,
