@@ -8,13 +8,15 @@
 pub mod camera;
 pub mod field;
 pub mod solve;
+pub mod uncertainty;
 
 use anyhow::Result;
-use nalgebra::{Isometry3, Matrix3, Point3, Rotation3, UnitQuaternion, Vector3};
+use nalgebra::{Isometry3, Matrix3, Matrix6, Point3, Rotation3, UnitQuaternion, Vector3, Vector6};
 
 use crate::detector::Detection;
 use camera::Intrinsics;
 use field::FieldLayout;
+use uncertainty::Pose2d;
 
 /// The FRC tag size since 2024: the black square's side, 6.5 in.
 pub const FRC_TAG_SIZE: f64 = 0.1651;
@@ -33,6 +35,102 @@ pub struct PoseConfig {
     pub robot_to_camera: Isometry3<f64>,
     /// Single-tag field poses more ambiguous than this are dropped.
     pub max_ambiguity: f64,
+    /// Each corner coordinate's noise, in pixels, that covariances assume.
+    pub corner_noise_px: f64,
+    /// Where the robot can be; poses elsewhere are dropped.
+    pub bounds: PoseBounds,
+}
+
+/// Where the robot can physically be. A solution outside these is dropped, which settles many
+/// single-tag ambiguities: the mirror-image pose usually has the robot tilted or off the floor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PoseBounds {
+    /// Most metres the robot's origin may be above (or below) the floor.
+    pub max_height: f64,
+    /// Most degrees the robot may tilt from level (roll and pitch together).
+    pub max_tilt_deg: f64,
+    /// Metres beyond the field's edges the robot may be.
+    pub field_margin: f64,
+}
+
+impl PoseBounds {
+    pub const DEFAULT: PoseBounds = PoseBounds { max_height: 2.0, max_tilt_deg: 30.0, field_margin: 1.0 };
+
+    /// Why the robot can't be at `robot` on `layout`'s field, if it can't.
+    pub fn check(&self, robot: &Isometry3<f64>, layout: &FieldLayout) -> Result<(), String> {
+        let t = robot.translation.vector;
+        let m = self.field_margin;
+        if !(-m..=layout.length + m).contains(&t.x) || !(-m..=layout.width + m).contains(&t.y) {
+            return Err(format!("robot off the field at ({:.2}, {:.2}) m", t.x, t.y));
+        }
+        if t.z.abs() > self.max_height {
+            return Err(format!("robot {:.2} m off the floor (max_height {})", t.z, self.max_height));
+        }
+        let tilt = (robot.rotation * Vector3::z()).z.clamp(-1.0, 1.0).acos().to_degrees();
+        if tilt > self.max_tilt_deg {
+            return Err(format!("robot tilted {tilt:.0}° (max_tilt {}; is robot_to_camera right?)", self.max_tilt_deg));
+        }
+        Ok(())
+    }
+}
+
+impl Default for PoseBounds {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// How far the fit's valleys are traced (see [`Estimator::trace`]): until the corners fit worse than
+/// the best by this many σ² (σ the corner noise), where a pose's likelihood is e^-12.5 the best's.
+const TRACE_LIMIT: f64 = 25.0;
+
+/// Most steps each way along a valley.
+const TRACE_STEPS: usize = 24;
+
+/// The fraction of each variance added back onto it (see [`uncertainty::inflate`]).
+const VARIANCE_SLACK: f64 = 0.1;
+
+/// A pose whose corners fit worse than corner noise would leave this rarely is rejected: the tags
+/// can't all be where the layout says, or the camera model is off.
+const MISFIT_PROBABILITY: f64 = 1e-4;
+
+/// The χ² value with even `dof` degrees of freedom that's exceeded with probability `p`: where
+/// `e^(-x/2) Σ_{i<dof/2} (x/2)^i / i!` falls to `p`.
+fn chi2_exceeded(dof: usize, p: f64) -> f64 {
+    let survival = |x: f64| {
+        let (mut term, mut sum) = (1.0, 1.0);
+        for i in 1..dof / 2 {
+            term *= x / 2.0 / i as f64;
+            sum += term;
+        }
+        (-x / 2.0).exp() * sum
+    };
+    let (mut lo, mut hi) = (0.0, 10.0 * dof as f64 + 100.0);
+    for _ in 0..100 {
+        let mid = 0.5 * (lo + hi);
+        if survival(mid) > p { lo = mid } else { hi = mid }
+    }
+    hi
+}
+
+/// The plane the tags all lie on, if they do (to 2° and 2 cm): its frame in the field, with z along
+/// the tags' faces' normal and the origin at `points`' centroid.
+fn common_plane(tags: &[&Isometry3<f64>], points: &[Vector3<f64>]) -> Option<Isometry3<f64>> {
+    let normal = tags[0].rotation * Vector3::x();
+    let on_plane = tags.iter().all(|t| {
+        (t.rotation * Vector3::x()).angle(&normal) < 2f64.to_radians()
+            && normal.dot(&(t.translation.vector - tags[0].translation.vector)).abs() < 0.02
+    });
+    if !on_plane {
+        return None;
+    }
+    let centroid = points.iter().sum::<Vector3<f64>>() / points.len() as f64;
+    let x = Vector3::z().cross(&normal).try_normalize(1e-9).unwrap_or_else(|| normal.cross(&Vector3::x()).normalize());
+    let basis = [x, normal.cross(&x), normal];
+    Some(Isometry3::from_parts(
+        centroid.into(),
+        UnitQuaternion::from_rotation_matrix(&Rotation3::from_basis_unchecked(&basis)),
+    ))
 }
 
 /// The camera's pose on the robot as it's configured: x, y, z in metres (forward, left, up from the
@@ -99,8 +197,35 @@ pub struct FieldPose {
     pub tags: Vec<u32>,
     /// RMS corner reprojection error, in pixels.
     pub error_px: f64,
-    /// The single tag's ambiguity, or 0 with several tags (they constrain the pose fully).
+    /// The best solution's RMS error over the next best's (0-1): near 1, two poses fit about equally
+    /// well. 0 with only one solution (on the field, within [`PoseBounds`]).
     pub ambiguity: f64,
+    /// The robot pose's covariance on the field (see [`uncertainty`]), covering rival solutions as
+    /// far as they fit.
+    pub covariance: Matrix6<f64>,
+    /// The standard deviations of x and y along the robot's forward and left axes, and of yaw (radians),
+    /// for WPILib's `addVisionMeasurement`.
+    pub std_devs: [f64; 3],
+}
+
+/// A detection whose tag is in the layout: the detection, its pose relative to the camera, and the
+/// tag's pose on the field.
+type Known<'a> = (&'a Detection, &'a TagPose, &'a Isometry3<f64>);
+
+/// A pose sampled along a fit's valley (see [`Estimator::trace`]).
+struct Sample {
+    /// World to optical camera.
+    pose: Isometry3<f64>,
+    /// The covariance of the pose's increment (as [`solve::information`]'s), across the valley.
+    covariance: Matrix6<f64>,
+    weight: f64,
+}
+
+/// The increment `[r, t]` (as [`solve::apply_increment`] takes) from `a` to `b`.
+fn increment_between(a: &Isometry3<f64>, b: &Isometry3<f64>) -> Vector6<f64> {
+    let r = (b.rotation * a.rotation.inverse()).scaled_axis();
+    let t = b.translation.vector - a.translation.vector;
+    Vector6::new(r.x, r.y, r.z, t.x, t.y, t.z)
 }
 
 /// The camera's optical frame (x right, y down, z forward) in WPILib's camera frame.
@@ -170,56 +295,214 @@ impl Estimator {
     }
 
     /// The robot's pose from the detections (with their [`Self::tag`] poses) whose tags are in the
-    /// layout: jointly over every corner when there are several, from the tag's pose when there's one.
-    pub fn field(&self, detections: &[Detection], tags: &[Option<TagPose>]) -> Option<FieldPose> {
-        let layout = self.cfg.layout.as_ref()?;
-        let corners = tag_corners(self.cfg.tag_size);
-        let known: Vec<(&Detection, &TagPose, &Isometry3<f64>)> =
+    /// layout. Ok(None) without any such tags; Err with the reason when the tags were seen but no
+    /// pose is trustworthy.
+    ///
+    /// Every tag is fitted jointly over every corner: each tag's two solutions seed the fit, and so
+    /// does the wall's when the tags are on one wall. The distinct fits that leave the robot within
+    /// [`PoseBounds`] are the candidates. The best is the pose, and the valleys through each widen its
+    /// covariance as far as they fit.
+    pub fn field(&self, detections: &[Detection], tags: &[Option<TagPose>]) -> Result<Option<FieldPose>, String> {
+        let Some(layout) = self.cfg.layout.as_ref() else { return Ok(None) };
+        let known: Vec<Known> =
             detections.iter().zip(tags).filter_map(|(d, t)| Some((d, t.as_ref()?, layout.tags.get(&d.id)?))).collect();
-        let field_to_camera =
-            |field_tag: &Isometry3<f64>, camera_to_tag: &Isometry3<f64>| field_tag * camera_to_tag.inverse();
-        let finish = |camera: Isometry3<f64>, tags: Vec<u32>, error_px, ambiguity| FieldPose {
-            robot: camera * self.cfg.robot_to_camera.inverse(),
-            camera,
-            tags,
-            error_px,
-            ambiguity,
-        };
-        match known.as_slice() {
-            [] => None,
-            [(d, t, field_tag)] => (t.ambiguity <= self.cfg.max_ambiguity)
-                .then(|| finish(field_to_camera(field_tag, &t.camera_to_tag), vec![d.id], t.error_px, t.ambiguity)),
-            _ => {
-                // Every corner, in field coordinates, against where it was seen.
-                let mut world = Vec::new();
-                let mut pixels = Vec::new();
-                for (d, _, field_tag) in &known {
-                    for (c, p) in corners.iter().zip(&d.corners) {
-                        world.push((*field_tag * Point3::from(*c)).coords);
-                        pixels.push(*p);
-                    }
-                }
-                let obs: Vec<[f64; 2]> = pixels.iter().map(|&p| self.camera.normalize(p)).collect();
-                let optical = rotation(wpilib_from_optical().inverse());
-                // Start from each tag's solutions (both, as one may be the mirror image) and keep the
-                // best fit after refining.
-                let best = known
-                    .iter()
-                    .flat_map(|(_, t, field_tag)| {
-                        std::iter::once(t.camera_to_tag).chain(t.alternate).map(|c| field_to_camera(field_tag, &c))
-                    })
-                    .filter_map(|camera| {
-                        let mut field_to_optical = optical * camera.inverse();
-                        let cost = solve::refine(&mut field_to_optical, &world, &obs)?;
-                        Some((field_to_optical, cost))
-                    })
-                    .min_by(|a, b| a.1.total_cmp(&b.1))?;
-                let field_to_optical = best.0;
-                let error_px = self.error_px(&field_to_optical, &world, &pixels);
-                let camera = (optical.inverse() * field_to_optical).inverse();
-                Some(finish(camera, known.iter().map(|(d, _, _)| d.id).collect(), error_px, 0.0))
+        if known.is_empty() {
+            return Ok(None);
+        }
+        self.solve_tags(&known, layout).map(Some)
+    }
+
+    /// The robot's pose from `known`, fitted jointly over every corner (see [`Self::field`]).
+    fn solve_tags(&self, known: &[Known], layout: &FieldLayout) -> Result<FieldPose, String> {
+        let corners = tag_corners(self.cfg.tag_size);
+        let ids: Vec<u32> = known.iter().map(|(d, _, _)| d.id).collect();
+        let fail = |why: String| Err(format!("tags {ids:?}: {why}"));
+
+        // Every corner, in field coordinates, against where it was seen.
+        let mut world = Vec::new();
+        let mut pixels = Vec::new();
+        for (d, _, field_tag) in known {
+            for (c, p) in corners.iter().zip(&d.corners) {
+                world.push((*field_tag * Point3::from(*c)).coords);
+                pixels.push(*p);
             }
         }
+        let obs: Vec<[f64; 2]> = pixels.iter().map(|&p| self.camera.normalize(p)).collect();
+        let optical = rotation(wpilib_from_optical().inverse());
+        let camera_to_robot = self.cfg.robot_to_camera.inverse();
+        let robot_of = |field_to_optical: &Isometry3<f64>| field_to_optical.inverse() * optical * camera_to_robot;
+
+        // Starting points: each tag's two solutions, and with several tags on one wall, the wall's
+        // own two (a wall seen head-on can mislead every tag's solutions alike).
+        let mut seeds: Vec<Isometry3<f64>> = known
+            .iter()
+            .flat_map(|(_, t, field_tag)| {
+                std::iter::once(t.camera_to_tag)
+                    .chain(t.alternate)
+                    .map(move |camera_to_tag| optical * (*field_tag * camera_to_tag.inverse()).inverse())
+            })
+            .collect();
+        let field_tags: Vec<&Isometry3<f64>> = known.iter().map(|(_, _, t)| *t).collect();
+        if known.len() > 1
+            && let Some(plane_to_field) = common_plane(&field_tags, &world)
+        {
+            let field_to_plane = plane_to_field.inverse();
+            let plane: Vec<[f64; 2]> =
+                world.iter().map(|w| field_to_plane * Point3::from(*w)).map(|p| [p.x, p.y]).collect();
+            seeds.extend(solve::solve_planar(&plane, &obs).into_iter().map(|(pose, _)| pose * field_to_plane));
+        }
+
+        // The distinct fits from those, best first, with their corners' squared error.
+        let mut fits: Vec<(Isometry3<f64>, f64)> = Vec::new();
+        for mut field_to_optical in seeds {
+            if solve::refine(&mut field_to_optical, &world, &obs).is_none() {
+                continue;
+            }
+            let same = |(f, _): &(Isometry3<f64>, f64)| {
+                f.rotation.angle_to(&field_to_optical.rotation) < 1e-3
+                    && (f.translation.vector - field_to_optical.translation.vector).norm() < 1e-3
+            };
+            if !fits.iter().any(same) {
+                fits.push((field_to_optical, self.squared_error(&field_to_optical, &world, &pixels)));
+            }
+        }
+        fits.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let mut reasons = Vec::new();
+        fits.retain(|(f, _)| self.cfg.bounds.check(&robot_of(f), layout).map_err(|e| reasons.push(e)).is_ok());
+        let Some(&(best, best_sse)) = fits.first() else {
+            return fail(reasons.first().cloned().unwrap_or_else(|| "no fit".into()));
+        };
+        let n = world.len() as f64;
+        let variance = self.cfg.corner_noise_px.powi(2);
+        if best_sse / variance > chi2_exceeded(2 * world.len() - 6, MISFIT_PROBABILITY) {
+            return fail(format!(
+                "corners fit {:.2} px RMS, too far for corner_noise_px {} (is the layout or calibration off?)",
+                (best_sse / n).sqrt(),
+                self.cfg.corner_noise_px
+            ));
+        }
+        let ambiguity = match fits.get(1) {
+            Some(&(_, sse)) if sse > 0.0 => (best_sse / sse).sqrt().min(1.0),
+            Some(_) => 1.0,
+            None => 0.0,
+        };
+        if known.len() == 1 && ambiguity > self.cfg.max_ambiguity {
+            return fail(format!("ambiguity {ambiguity:.2} over max_ambiguity {}", self.cfg.max_ambiguity));
+        }
+
+        // The likely poses along each fit's valley, as robot poses with covariances and weights.
+        let mut samples: Vec<Sample> = Vec::new();
+        for (f, _) in &fits {
+            self.trace(
+                f,
+                best_sse,
+                &world,
+                &obs,
+                &pixels,
+                &|f| self.cfg.bounds.check(&robot_of(f), layout).is_ok(),
+                &mut samples,
+            );
+        }
+        let members: Vec<(Isometry3<f64>, Matrix6<f64>, f64)> = samples
+            .iter()
+            .map(|s| {
+                let camera_cov = uncertainty::camera_in_world(&s.pose, &s.covariance);
+                let field_to_camera = s.pose.inverse();
+                let robot = robot_of(&s.pose);
+                (
+                    robot,
+                    uncertainty::attached(&field_to_camera, &(field_to_camera.inverse() * robot), &camera_cov),
+                    s.weight,
+                )
+            })
+            .collect();
+        let robot = robot_of(&best);
+        let covariance = uncertainty::inflate(&uncertainty::mixture(&robot, &members), VARIANCE_SLACK);
+        let floor: Vec<(Pose2d, f64)> = members.iter().map(|(p, c, w)| (Pose2d::project(p, c), *w)).collect();
+        let mut pose2d = Pose2d::project(&robot, &Matrix6::zeros());
+        pose2d.covariance = uncertainty::inflate(&pose2d.mixture(&floor), VARIANCE_SLACK);
+
+        Ok(FieldPose {
+            robot,
+            camera: best.inverse() * optical,
+            tags: ids,
+            error_px: (best_sse / n).sqrt(),
+            ambiguity,
+            covariance,
+            std_devs: pose2d.local_std_devs(),
+        })
+    }
+
+    /// Sample the poses along the fit's valley through `start` (world to optical), appending them to
+    /// `samples`: from `start`, step both ways along the direction the corners constrain least,
+    /// re-fitting the other five directions at each step, until the corners fit worse than `best_sse`
+    /// by [`TRACE_LIMIT`] σ², or the pose leaves `allowed`. Each sample carries its covariance with
+    /// the traced direction conditioned out (the trace itself covers that), and a weight: its
+    /// likelihood times its spacing along the valley. Where a valley is a narrow bowl, the samples
+    /// make up its Gaussian; where it's long and flat (tags seen head-on, from afar), they follow it.
+    /// A start within a step of an earlier sample is in a valley already traced, and adds nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn trace(
+        &self,
+        start: &Isometry3<f64>,
+        best_sse: f64,
+        world: &[Vector3<f64>],
+        obs: &[[f64; 2]],
+        pixels: &[[f64; 2]],
+        allowed: &dyn Fn(&Isometry3<f64>) -> bool,
+        samples: &mut Vec<Sample>,
+    ) {
+        let variance = self.cfg.corner_noise_px.powi(2);
+        let information = |p: &Isometry3<f64>| solve::information(p, world, self.camera.fx, self.camera.fy) / variance;
+        // The least constrained direction and its standard deviation, and the covariance of the other
+        // five directions given it.
+        let local = |info: &Matrix6<f64>| -> Option<(Vector6<f64>, f64, Matrix6<f64>)> {
+            let eig = info.symmetric_eigen();
+            let i = eig.eigenvalues.imin();
+            let v: Vector6<f64> = eig.eigenvectors.column(i).into_owned();
+            let p = info.try_inverse()?;
+            let pv = p * v;
+            Some((v, 1.0 / eig.eigenvalues[i].max(1e-12).sqrt(), p - pv * pv.transpose() / v.dot(&pv)))
+        };
+        let near_traced = |pose: &Isometry3<f64>, info: &Matrix6<f64>| {
+            samples.iter().any(|s| {
+                let d = increment_between(&s.pose, pose);
+                d.dot(&(info * d)) < 1.0
+            })
+        };
+        let start_info = information(start);
+        let Some((v0, h0, cov0)) = local(&start_info) else { return };
+        if near_traced(start, &start_info) {
+            return;
+        }
+        let sse0 = self.squared_error(start, world, pixels);
+        let weight = |sse: f64, h: f64| (-(sse - best_sse) / (2.0 * variance)).exp() * h;
+        samples.push(Sample { pose: *start, covariance: cov0, weight: weight(sse0, h0) });
+        for sign in [1.0, -1.0] {
+            let (mut pose, mut prev) = (*start, v0 * sign);
+            let (mut v, mut h) = (prev, h0);
+            for _ in 0..TRACE_STEPS {
+                let mut next = solve::apply_increment(&pose, &(v * h));
+                if solve::refine_across(&mut next, world, obs, &v).is_none() || !allowed(&next) {
+                    break;
+                }
+                let sse = self.squared_error(&next, world, pixels);
+                if (sse - best_sse) / variance > TRACE_LIMIT {
+                    break;
+                }
+                let info = information(&next);
+                let Some((nv, nh, cov)) = local(&info) else { break };
+                samples.push(Sample { pose: next, covariance: cov, weight: weight(sse, nh) });
+                (pose, prev) = (next, v);
+                (v, h) = (if nv.dot(&prev) < 0.0 { -nv } else { nv }, nh);
+            }
+        }
+    }
+
+    /// The sum of squared pixel distances between `points` taken into the optical frame by
+    /// `to_optical`, projected, and the detected `pixels`.
+    fn squared_error(&self, to_optical: &Isometry3<f64>, points: &[Vector3<f64>], pixels: &[[f64; 2]]) -> f64 {
+        self.error_px(to_optical, points, pixels).powi(2) * points.len() as f64
     }
 
     /// RMS pixel distance between `points` taken into the optical frame by `to_optical`, projected,
@@ -251,6 +534,8 @@ mod tests {
             layout,
             robot_to_camera: Isometry3::identity(),
             max_ambiguity: 0.2,
+            corner_noise_px: 1.0,
+            bounds: PoseBounds::DEFAULT,
         }
     }
 
@@ -326,14 +611,34 @@ mod tests {
             [a, b].iter().map(|&id| detection(id, corners_px(&est, &(camera.inverse() * layout.tags[&id])))).collect();
         let poses: Vec<Option<TagPose>> = seen.iter().map(|d| est.tag(d)).collect();
 
-        let two = est.field(&seen, &poses).unwrap();
+        let two = est.field(&seen, &poses).unwrap().unwrap();
         assert_eq!(two.tags, vec![a, b]);
         assert!((two.robot.translation.vector - robot.translation.vector).norm() < 1e-6, "{two:?}");
         assert!(two.robot.rotation.angle_to(&robot.rotation) < 1e-6);
 
-        let one = est.field(&seen[..1], &poses[..1]).unwrap();
+        let one = est.field(&seen[..1], &poses[..1]).unwrap().unwrap();
         assert!((one.robot.translation.vector - robot.translation.vector).norm() < 1e-6);
+        // Two tags pin the robot down better than one, and the standard deviations say so.
+        assert!(two.std_devs.iter().zip(one.std_devs).all(|(t, o)| *t < o), "{:?} vs {:?}", two.std_devs, one.std_devs);
+        assert!(one.std_devs.iter().all(|s| s.is_finite() && *s > 0.0));
         // Tags not in the layout don't count.
-        assert!(est.field(&[detection(99, seen[0].corners)], &poses[..1]).is_none());
+        assert_eq!(est.field(&[detection(99, seen[0].corners)], &poses[..1]), Ok(None));
+
+        // A corner 15 px from where the rest put it: no pose fits that well enough to publish.
+        let mut bent = seen.clone();
+        bent[0].corners[0][0] += 15.0;
+        let bent_poses: Vec<Option<TagPose>> = bent.iter().map(|d| est.tag(d)).collect();
+        let why = est.field(&bent, &bent_poses).unwrap_err();
+        assert!(why.contains("corners fit"), "{why}");
+
+        // A robot that can't be off the floor at all: the pose is dropped, and says why.
+        let grounded = PoseConfig {
+            robot_to_camera,
+            bounds: PoseBounds { max_height: 0.0, ..PoseBounds::DEFAULT },
+            ..config(Some(layout.clone()))
+        };
+        let est = Estimator::new(&grounded, 1280, 720).unwrap();
+        let why = est.field(&seen, &poses).unwrap_err();
+        assert!(why.contains("off the floor"), "{why}");
     }
 }

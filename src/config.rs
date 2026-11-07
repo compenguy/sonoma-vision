@@ -117,6 +117,9 @@ pub const KEYS: &[Key] = &[
     key("pose", "field_layout", "field_layout", Kind::FieldLayout),
     key("pose", "robot_to_camera", "robot_to_camera", Kind::Transform),
     key("pose", "max_ambiguity", "max_ambiguity", Kind::Float),
+    key("pose", "corner_noise_px", "corner_noise_px", Kind::Float),
+    key("pose", "max_height", "max_height", Kind::Float),
+    key("pose", "max_tilt", "max_tilt", Kind::Float),
     key("log", "level", "log_level", Kind::Str),
 ];
 

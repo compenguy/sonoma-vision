@@ -5,23 +5,25 @@
 //! [`super::camera::Intrinsics::normalize`]).
 
 use nalgebra::{
-    Isometry3, Matrix2, Matrix3, Matrix6, Rotation3, SMatrix, SVector, Translation3, UnitQuaternion, Vector3,
+    Isometry3, Matrix2, Matrix3, Matrix6, Rotation3, SMatrix, SVector, Translation3, UnitQuaternion, Vector3, Vector6,
 };
 
-/// The homography taking plane points `(x, y)` (z = 0) to normalised image points, from exactly four
-/// correspondences. None if they're degenerate (three in a line).
-fn homography(plane: &[[f64; 2]; 4], image: &[[f64; 2]; 4]) -> Option<Matrix3<f64>> {
+/// The homography taking plane points `(x, y)` (z = 0) to normalised image points, from four or more
+/// correspondences (least squares beyond four). None if they're degenerate (three of four in a line).
+fn homography(plane: &[[f64; 2]], image: &[[f64; 2]]) -> Option<Matrix3<f64>> {
     // h00 x + h01 y + h02 - u (h20 x + h21 y) = u, and likewise for v, with h22 = 1.
-    let mut a = SMatrix::<f64, 8, 8>::zeros();
-    let mut b = SVector::<f64, 8>::zeros();
-    for (i, (&[x, y], &[u, v])) in plane.iter().zip(image).enumerate() {
-        let (r0, r1) = (2 * i, 2 * i + 1);
-        a.row_mut(r0).copy_from_slice(&[x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y]);
-        a.row_mut(r1).copy_from_slice(&[0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y]);
-        b[r0] = u;
-        b[r1] = v;
+    let mut ata = SMatrix::<f64, 8, 8>::zeros();
+    let mut atb = SVector::<f64, 8>::zeros();
+    for (&[x, y], &[u, v]) in plane.iter().zip(image) {
+        for (row, rhs) in [
+            (SVector::<f64, 8>::from([x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y]), u),
+            (SVector::<f64, 8>::from([0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y]), v),
+        ] {
+            ata += row * row.transpose();
+            atb += row * rhs;
+        }
     }
-    let h = a.lu().solve(&b)?;
+    let h = ata.lu().solve(&atb)?;
     let m = Matrix3::new(h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 1.0);
     m.iter().all(|v| v.is_finite()).then_some(m)
 }
@@ -97,41 +99,99 @@ fn cost(pose: &Isometry3<f64>, world: &[Vector3<f64>], obs: &[[f64; 2]]) -> Opti
     Some(sum)
 }
 
+/// Where `pose` (world to optical camera) projects the world point `x`, in normalised image
+/// coordinates, and that projection's derivative with respect to the pose's increment: a rotation
+/// `r` applied on the left (`exp([r]×)·R`), then a translation added to `t`, `[r, t]`.
+fn point_jacobian(pose: &Isometry3<f64>, x: &Vector3<f64>) -> (SMatrix<f64, 2, 6>, [f64; 2]) {
+    let rx = pose.rotation * x;
+    let c = rx + pose.translation.vector;
+    let iz = 1.0 / c.z;
+    // d(projection)/d(camera point), and d(camera point)/d(rotation increment, translation).
+    let dp = SMatrix::<f64, 2, 3>::new(iz, 0.0, -c.x * iz * iz, 0.0, iz, -c.y * iz * iz);
+    let mut dc = SMatrix::<f64, 3, 6>::zeros();
+    dc.fixed_view_mut::<3, 3>(0, 0).copy_from(&-rx.cross_matrix());
+    dc.fixed_view_mut::<3, 3>(0, 3).copy_from(&Matrix3::identity());
+    (dp * dc, [c.x * iz, c.y * iz])
+}
+
+/// The Fisher information about `pose`'s increment (as [`apply_increment`] takes) that the world points'
+/// projections carry, with each image coordinate's noise one pixel at focal lengths `fx`, `fy`:
+/// `Σ Jᵀ diag(fx², fy²) J`. Divide by the corner noise's variance (pixels²) for the information
+/// at that noise; its inverse is then the pose's covariance (Gauss-Newton, to first order).
+pub fn information(pose: &Isometry3<f64>, world: &[Vector3<f64>], fx: f64, fy: f64) -> Matrix6<f64> {
+    let w = Matrix2::new(fx * fx, 0.0, 0.0, fy * fy);
+    world.iter().fold(Matrix6::zeros(), |acc, x| {
+        let (jac, _) = point_jacobian(pose, x);
+        acc + jac.transpose() * w * jac
+    })
+}
+
 /// Refine `pose` (world to optical camera) to minimise the reprojection error of `world` points
 /// against the observations: Levenberg-Marquardt over a rotation increment and the translation.
 /// Returns the final cost, or None if the starting pose puts a point behind the camera.
 pub fn refine(pose: &mut Isometry3<f64>, world: &[Vector3<f64>], obs: &[[f64; 2]]) -> Option<f64> {
+    refine_in(pose, world, obs, &Matrix6::identity())
+}
+
+/// As [`refine`], but holding the pose fixed along `along` (an increment, as [`apply_increment`] takes):
+/// only the other five directions are fitted.
+pub fn refine_across(
+    pose: &mut Isometry3<f64>,
+    world: &[Vector3<f64>],
+    obs: &[[f64; 2]],
+    along: &Vector6<f64>,
+) -> Option<f64> {
+    // The five directions orthogonal to `along`: eigenvectors of its projector with eigenvalue 0.
+    let v = along.normalize();
+    let eig = (v * v.transpose()).symmetric_eigen();
+    let mut basis = SMatrix::<f64, 6, 5>::zeros();
+    let mut k = 0;
+    for i in 0..6 {
+        if eig.eigenvalues[i] < 0.5 && k < 5 {
+            basis.set_column(k, &eig.eigenvectors.column(i));
+            k += 1;
+        }
+    }
+    (k == 5).then_some(())?;
+    refine_in(pose, world, obs, &basis)
+}
+
+/// `pose` moved by an increment `[r, t]`: the rotation `r` applied on the left (`exp([r]×)·R`), then
+/// `t` added to the translation. [`refine`] and [`information`] use the same increments.
+pub fn apply_increment(pose: &Isometry3<f64>, inc: &Vector6<f64>) -> Isometry3<f64> {
+    let rotation = UnitQuaternion::from_scaled_axis(inc.fixed_rows::<3>(0).into_owned()) * pose.rotation;
+    Isometry3::from_parts(Translation3::from(pose.translation.vector + inc.fixed_rows::<3>(3)), rotation)
+}
+
+/// Levenberg-Marquardt over the increments `basis · δ`.
+fn refine_in<const K: usize>(
+    pose: &mut Isometry3<f64>,
+    world: &[Vector3<f64>],
+    obs: &[[f64; 2]],
+    basis: &SMatrix<f64, 6, K>,
+) -> Option<f64> {
     let mut current = cost(pose, world, obs)?;
     let mut lambda = 1e-3;
     for _ in 0..50 {
-        let (mut jtj, mut jte) = (Matrix6::<f64>::zeros(), SVector::<f64, 6>::zeros());
+        let (mut jtj, mut jte) = (SMatrix::<f64, K, K>::zeros(), SVector::<f64, K>::zeros());
         for (x, &[u, v]) in world.iter().zip(obs) {
-            let rx = pose.rotation * x;
-            let c = rx + pose.translation.vector;
-            let iz = 1.0 / c.z;
-            // d(projection)/d(camera point), and d(camera point)/d(rotation increment, translation).
-            let dp = SMatrix::<f64, 2, 3>::new(iz, 0.0, -c.x * iz * iz, 0.0, iz, -c.y * iz * iz);
-            let mut dc = SMatrix::<f64, 3, 6>::zeros();
-            dc.fixed_view_mut::<3, 3>(0, 0).copy_from(&-rx.cross_matrix());
-            dc.fixed_view_mut::<3, 3>(0, 3).copy_from(&Matrix3::identity());
-            let jac = dp * dc;
-            let e = nalgebra::Vector2::new(c.x * iz - u, c.y * iz - v);
+            let (jac, [nu, nv]) = point_jacobian(pose, x);
+            let jac = jac * basis;
+            let e = nalgebra::Vector2::new(nu - u, nv - v);
             jtj += jac.transpose() * jac;
             jte += jac.transpose() * e;
         }
         let mut improved = false;
         while lambda < 1e8 {
             let mut damped = jtj;
-            for i in 0..6 {
+            for i in 0..K {
                 damped[(i, i)] += lambda * jtj[(i, i)].max(1e-12);
             }
             let Some(step) = damped.cholesky().map(|c| -c.solve(&jte)) else {
                 lambda *= 10.0;
                 continue;
             };
-            let rotation = UnitQuaternion::from_scaled_axis(step.fixed_rows::<3>(0).into_owned()) * pose.rotation;
-            let translation = Translation3::from(pose.translation.vector + step.fixed_rows::<3>(3));
-            let candidate = Isometry3::from_parts(translation, rotation);
+            let candidate = apply_increment(pose, &(basis * step));
             match cost(&candidate, world, obs) {
                 Some(c) if c < current => {
                     let gain = current - c;
@@ -151,12 +211,13 @@ pub fn refine(pose: &mut Isometry3<f64>, world: &[Vector3<f64>], obs: &[[f64; 2]
     Some(current)
 }
 
-/// Both poses of a square (or any planar four-point) target whose plane points (z = 0) are `plane`,
-/// seen at the normalised `image` points: IPPE's two candidates, each refined. Lowest cost first.
-pub fn solve_planar(plane: &[[f64; 2]; 4], image: &[[f64; 2]; 4]) -> Vec<(Isometry3<f64>, f64)> {
+/// Both poses of a planar target (a tag, or several tags on one wall) whose plane points (z = 0) are
+/// `plane`, seen at the normalised `image` points: IPPE's two candidates, each refined. IPPE reads the
+/// plane's appearance at its origin, so the origin is best at the points' centroid. Lowest cost first.
+pub fn solve_planar(plane: &[[f64; 2]], image: &[[f64; 2]]) -> Vec<(Isometry3<f64>, f64)> {
     let Some(h) = homography(plane, image) else { return Vec::new() };
     let Some(rotations) = ippe_rotations(&h) else { return Vec::new() };
-    let world = plane.map(|[x, y]| Vector3::new(x, y, 0.0));
+    let world: Vec<Vector3<f64>> = plane.iter().map(|&[x, y]| Vector3::new(x, y, 0.0)).collect();
     let mut out: Vec<(Isometry3<f64>, f64)> = rotations
         .iter()
         .filter_map(|r| {

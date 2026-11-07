@@ -15,10 +15,14 @@
 //!   tag leaves view; `visible` turns false. If a frame has a tag ID twice, the clearer one is used.
 //!   With its pose solved, also `distance` (m), `bearing` (degrees, left positive), `ambiguity`, and
 //!   `camera_to_tag` (struct Transform3d: the tag's pose in the camera's frame).
-//! - With a field layout, the robot's pose when tags from it are in view: `robot_pose` (struct Pose3d,
-//!   timestamped with the capture time, for `addVisionMeasurement`), `pose_tags` (int[], the tags used),
-//!   `pose_error_px` and `pose_ambiguity` (double), and `field`, a WPILib Field2d (`Robot` is
-//!   `[x, y, degrees]`) for dashboards' field widgets.
+//! - With a field layout, the robot's pose when tags from it are in view, each timestamped with the
+//!   capture time: `robot_pose` (struct Pose3d), `robot_pose_measurement` (`double[6]`: x, y, yaw in
+//!   radians, then the standard deviations of x and y along the robot's forward and left axes and of
+//!   yaw, which is what `addVisionMeasurement` takes, in one atomic value), `robot_pose_covariance`
+//!   (`double[36]`, row-major 6×6 over x, y, z, rx, ry, rz in the field's axes), `pose_tags` (int[],
+//!   the tags used), `pose_error_px` and `pose_ambiguity` (double), and `field`, a WPILib Field2d
+//!   (`Robot` is `[x, y, degrees]`) for dashboards' field widgets. When tags were in view but gave no
+//!   trustworthy pose, `pose_rejected` (string) says why; it's empty while poses are published.
 //!
 //! With the camera stream on, it's also advertised as WPILib's CameraServer advertises streams, under
 //! `/CameraPublisher/<name>` (`streams`, `source`, `description`, `connected`, `mode`, `modes`), so
@@ -26,10 +30,10 @@
 //!
 //! Settings that can be changed while running live under `<table>/settings/` (see
 //! [`crate::settings::Key`]): camera exposure, gain and focus, the detector's thresholds, the pose
-//! solver's mount and ambiguity limit, and the stream's look, rate and size. They're persistent topics,
-//! so the robot's NT server keeps them across restarts. On connecting, values already on the server
-//! win over the configuration's; settings the server doesn't have are published from ours. Edits from
-//! a dashboard or the robot program apply immediately.
+//! solver's mount, limits and noise model, and the stream's look, rate and size. They're persistent
+//! topics, so the robot's NT server keeps them across restarts. On connecting, values already on the
+//! server win over the configuration's; settings the server doesn't have are published from ours.
+//! Edits from a dashboard or the robot program apply immediately.
 //!
 //! The field layout and the capture mode are chosen under `<table>/settings/field_layout/` and
 //! `<table>/settings/capture_mode/`, laid out as WPILib's `SendableChooser` (`.type` "String
@@ -84,8 +88,10 @@ pub struct FrameResult {
     pub dropped: u64,
     /// Each detection's pose relative to the camera, where it could be solved.
     pub tag_poses: Vec<Option<TagPose>>,
-    /// The robot's pose on the field, if tags from the layout were in view.
+    /// The robot's pose on the field, if tags from the layout were in view and it was trustworthy.
     pub field_pose: Option<FieldPose>,
+    /// Why tags from the layout were in view but gave no pose.
+    pub pose_rejected: Option<String>,
 }
 
 /// Where the NT server is: `local` (127.0.0.1, the robot program on the same controller), a team
@@ -223,6 +229,9 @@ struct Publishers {
     pose_tags: Publisher<Vec<i64>>,
     pose_error_px: Publisher<f64>,
     pose_ambiguity: Publisher<f64>,
+    robot_pose_measurement: Publisher<Vec<f64>>,
+    robot_pose_covariance: Publisher<Vec<f64>>,
+    pose_rejected: Publisher<String>,
     field_type: Publisher<String>,
     field_robot: Publisher<Vec<f64>>,
 }
@@ -252,6 +261,9 @@ async fn publish_loop(
         pose_tags: topic("pose_tags").publish_bypass(Default::default()).await?,
         pose_error_px: topic("pose_error_px").publish_bypass(Default::default()).await?,
         pose_ambiguity: topic("pose_ambiguity").publish_bypass(Default::default()).await?,
+        robot_pose_measurement: topic("robot_pose_measurement").publish_bypass(Default::default()).await?,
+        robot_pose_covariance: topic("robot_pose_covariance").publish_bypass(Default::default()).await?,
+        pose_rejected: topic("pose_rejected").publish_bypass(Default::default()).await?,
         field_type: topic("field/.type").publish_bypass(Default::default()).await?,
         field_robot: topic("field/Robot").publish_bypass(Default::default()).await?,
     };
@@ -283,7 +295,16 @@ async fn publish_loop(
             p.pose_ambiguity.set_at(f.ambiguity, capture_server).await?;
             let (_, _, yaw) = f.robot.rotation.euler_angles();
             let t = f.robot.translation.vector;
+            let [sx, sy, syaw] = f.std_devs;
+            p.robot_pose_measurement.set_at(vec![t.x, t.y, yaw, sx, sy, syaw], capture_server).await?;
+            // Row-major (nalgebra stores column-major).
+            p.robot_pose_covariance.set_at(f.covariance.transpose().as_slice().to_vec(), capture_server).await?;
             p.field_robot.set_at(vec![t.x, t.y, yaw.to_degrees()], capture_server).await?;
+        }
+        match (&r.field_pose, &r.pose_rejected) {
+            (Some(_), _) => p.pose_rejected.set_at(String::new(), capture_server).await?,
+            (None, Some(why)) => p.pose_rejected.set_at(why.clone(), capture_server).await?,
+            (None, None) => {}
         }
 
         // Per tag ID, the clearest sighting.

@@ -16,7 +16,7 @@ use sonoma_vision::detector::{Detector, Family};
 use sonoma_vision::nt::{self, CameraAdvert, NtConfig};
 use sonoma_vision::pose::camera::Intrinsics;
 use sonoma_vision::pose::field::{self, FieldLayout};
-use sonoma_vision::pose::{FRC_TAG_SIZE, MountPose, PoseConfig};
+use sonoma_vision::pose::{FRC_TAG_SIZE, MountPose, PoseBounds, PoseConfig};
 use sonoma_vision::settings::{NO_LAYOUT, Settings, limits};
 use sonoma_vision::stream::{self, ConfigPage, StreamConfig};
 use sonoma_vision::vision::{self, Setup};
@@ -156,6 +156,16 @@ struct Args {
     /// Single-tag robot poses more ambiguous than this (0-1) aren't published. Live setting.
     #[arg(long, default_value_t = Settings::DEFAULT.max_ambiguity, value_parser = limits::decimal(limits::MAX_AMBIGUITY))]
     max_ambiguity: f64,
+    /// Each corner coordinate's noise, in pixels, that pose covariances (and the published standard
+    /// deviations) assume. Live setting.
+    #[arg(long, default_value_t = Settings::DEFAULT.corner_noise_px, value_parser = limits::decimal(limits::CORNER_NOISE_PX))]
+    corner_noise_px: f64,
+    /// Robot poses more than this many metres off the floor aren't published. Live setting.
+    #[arg(long, default_value_t = Settings::DEFAULT.max_height, value_parser = limits::decimal(limits::MAX_HEIGHT))]
+    max_height: f64,
+    /// Robot poses tilted more than this many degrees from level aren't published. Live setting.
+    #[arg(long, default_value_t = Settings::DEFAULT.max_tilt, value_parser = limits::decimal(limits::MAX_TILT))]
+    max_tilt: f64,
 
     /// Log level, or an env_logger filter such as `info,sonoma_vision::nt=debug`.
     #[arg(long, default_value = "info")]
@@ -205,6 +215,9 @@ fn main() -> Result<()> {
         min_border_cells: args.min_border_cells,
         sharpening: args.sharpening,
         max_ambiguity: args.max_ambiguity,
+        corner_noise_px: args.corner_noise_px,
+        max_height: args.max_height,
+        max_tilt: args.max_tilt,
         robot_to_camera: args.robot_to_camera,
         stream_auto_levels: args.stream_auto_levels,
         stream_gamma: args.stream_gamma,
@@ -230,10 +243,12 @@ fn main() -> Result<()> {
         },
         fov_deg: args.fov,
         tag_size: args.tag_size,
-        // Live settings.
+        // Live settings, which the vision thread fills in.
         layout: None,
-        robot_to_camera: args.robot_to_camera.isometry(),
-        max_ambiguity: args.max_ambiguity,
+        robot_to_camera: Default::default(),
+        max_ambiguity: Settings::DEFAULT.max_ambiguity,
+        corner_noise_px: Settings::DEFAULT.corner_noise_px,
+        bounds: PoseBounds::DEFAULT,
     };
     if pose.calibration.is_none() {
         warn!("no --calibration: approximating the camera from a {}° field of view; poses are rough", args.fov);
@@ -476,6 +491,9 @@ mod tests {
             min_border_cells: 20,
             sharpening: 0.5,
             max_ambiguity: 0.1,
+            corner_noise_px: 0.5,
+            max_height: 1.0,
+            max_tilt: 10.0,
             robot_to_camera: MountPose([0.3, 0.0, 0.5, 0.0, -15.0, 0.0]),
             stream_auto_levels: false,
             stream_gamma: 1.5,
@@ -504,6 +522,7 @@ mod tests {
             "{text}"
         );
         assert_eq!((back.min_border_cells, back.sharpening, back.max_ambiguity), (20, 0.5, 0.1));
+        assert_eq!((back.corner_noise_px, back.max_height, back.max_tilt), (0.5, 1.0, 10.0));
         assert_eq!(back.robot_to_camera, live.robot_to_camera);
         assert_eq!((back.stream_auto_levels, back.stream_gamma, back.stream_overlay), (false, 1.5, true));
         assert_eq!((back.stream_quality, back.stream_fps, back.stream_scale), (70, 30.0, 2));

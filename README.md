@@ -26,7 +26,8 @@ running service for an FRC robot, built around that detector.
 - **Capture timestamps on the robot's clock.** The driver's capture time is mapped onto the NT server's
   clock through NT4 time sync, ready for `addVisionMeasurement`.
 - **NetworkTables 4 publishing.** An atomic per-frame record, `robot_pose` (Pose3d) and `camera_to_tag`
-  (Transform3d) as WPILib structs, a Field2d, and per-tag topics for dashboards.
+  (Transform3d) as WPILib structs, the `addVisionMeasurement` arguments with standard deviations in one
+  atomic value, a Field2d, and per-tag topics for dashboards.
 - **Live settings over NT.** Detection, exposure, gain, focus, stream and mounting settings, plus
   drop-downs for the field layout and the camera mode. The server keeps them across restarts, and
   `/config.toml` saves them to a file.
@@ -39,13 +40,11 @@ running service for an FRC robot, built around that detector.
 
 **napa-vision only:**
 
-- **Pose uncertainty.** Every pose carries a 6×6 covariance computed from that frame's geometry, and
-  `local_std_devs()` gives the standard deviations `addVisionMeasurement` takes. sonoma-vision
-  publishes poses without any uncertainty.
-- **Multi-tag robustness.** A RANSAC fallback when three or more tags disagree, outlier rejection with a
-  reason recorded per tag, bounds on where the camera can physically be, and ambiguous single-tag poses
-  down-weighted rather than dropped.
-- **Tag bearings with covariances,** for aiming at a tag rather than localizing.
+- **Multi-tag outlier handling.** A RANSAC fallback when three or more tags disagree, and outlier
+  rejection with a reason recorded per tag. sonoma-vision fits every tag in view together, and rejects
+  the whole pose when its corners fit too poorly.
+- **Covariances for single tags and tag bearings,** for aiming at a tag rather than localizing.
+  sonoma-vision publishes uncertainty for the robot's pose only.
 - **Stereo:** one pose from two calibrated cameras.
 - **Tools:** camera calibration from checkerboard photos (`napa-calibrate`), printable tags
   (`napa-tag`), scoring on your own labeled footage (`napa-benchmark`), and a drop-in replacement for
@@ -69,7 +68,7 @@ credits and the licenses of other vendored code.
 | `src/nt.rs` | NT4 publishing via [nt_client](https://crates.io/crates/nt_client) (patched, `vendor/`) |
 | `src/stream.rs` | Optional MJPEG camera stream for dashboards, with tag overlays, and `/config.toml` |
 | `src/settings.rs` | Settings that can be changed while running, over NT |
-| `src/pose/` | Pose solving: camera model, IPPE and refinement, field layouts |
+| `src/pose/` | Pose solving: camera model, IPPE and refinement, uncertainty, field layouts |
 | `src/config.rs` | `sonoma-vision.toml`: finding, reading and writing configuration files |
 | `src/vision.rs` | The vision thread: capture, detect and solve poses, applying live settings |
 | `src/main.rs` | The service: options, startup, and the vision thread feeding the NT publisher |
@@ -114,7 +113,10 @@ Under the table (default `/sonoma/cam0`):
 | `tags/<id>/camera_to_tag` | struct Transform3d | The tag's pose in the camera's frame |
 | `robot_pose` | struct Pose3d | The robot's pose on the field, timestamped with the capture time |
 | `pose_tags` | int[] | The tags `robot_pose` came from |
-| `pose_error_px`, `pose_ambiguity` | double | Its reprojection error, and ambiguity (single tag only) |
+| `robot_pose_measurement` | double[6] | `[x, y, yaw, std_x, std_y, std_yaw]`: what `addVisionMeasurement` takes, in one value (see Poses) |
+| `robot_pose_covariance` | double[36] | The robot pose's 6×6 covariance, row-major, over x, y, z, rx, ry, rz in the field's axes |
+| `pose_error_px`, `pose_ambiguity` | double | Its RMS reprojection error, and how nearly a second pose fits as well |
+| `pose_rejected` | string | Why tags from the layout were in view but gave no pose; empty while poses are published |
 | `field` | Field2d | The robot's pose for dashboards' field widgets |
 
 The `tags/<id>/` topics are for dashboards: a group per tag ID seen, rounded to one decimal so they're
@@ -126,14 +128,16 @@ on the NT server's clock, the clock the robot program's own NT timestamps use. C
 pixel-centre coordinates, in napa-vision's (OpenCV's AprilTag) corner order: the printed tag's top-left,
 top-right, bottom-right, bottom-left.
 
-Reading the robot's pose in robot code (Java), for the drivetrain's pose estimator:
+Feeding the robot's pose to the drivetrain's pose estimator (Java), with its standard deviations:
 
 ```java
-StructSubscriber<Pose3d> poses = NetworkTableInstance.getDefault()
-    .getStructTopic("/sonoma/cam0/robot_pose", Pose3d.struct).subscribe(new Pose3d());
+DoubleArraySubscriber measurements = NetworkTableInstance.getDefault()
+    .getDoubleArrayTopic("/sonoma/cam0/robot_pose_measurement").subscribe(new double[0]);
 
-for (TimestampedObject<Pose3d> p : poses.readQueue()) {
-  poseEstimator.addVisionMeasurement(p.value.toPose2d(), p.timestamp / 1e6);
+for (TimestampedDoubleArray m : measurements.readQueue()) {
+  double[] v = m.value; // x, y, yaw (radians), then the standard deviations of each
+  poseEstimator.addVisionMeasurement(
+      new Pose2d(v[0], v[1], new Rotation2d(v[2])), m.timestamp / 1e6, VecBuilder.fill(v[3], v[4], v[5]));
 }
 ```
 
@@ -157,8 +161,9 @@ for (TimestampedDoubleArray f : frames.readQueue()) {
 ## Poses
 
 Each tag's pose relative to the camera is solved from its four corners (IPPE, then a least-squares
-refinement), and from the tags the field layout knows, the robot's pose on the field: jointly over
-every corner when several tags are in view, from the one tag's pose otherwise. Poses use WPILib's
+refinement). From the tags the field layout knows, the robot's pose on the field is fitted to every
+corner in view at once. Each tag's two solutions seed that fit, and so does the wall's when several
+tags are on one wall. The best fit with the robot somewhere it can be is the pose. Poses use WPILib's
 conventions: the camera frame is X forward, Y left, Z up, and tags face out along their +X. With no
 field layout selected, no poses are solved at all (tags are still detected and published).
 
@@ -177,9 +182,61 @@ field layout selected, no poses are solved at all (tags are still detected and p
   forward, left and up from the robot's origin; degrees), as WPILib's robot-to-camera transform.
 - **Tag size.** `--tag-size`, the black square's side in metres (FRC: 0.1651, 6.5 in).
 - **Ambiguity.** A single tag seen nearly face-on has two poses that fit almost equally well (the
-  second is mirrored about the line of sight). `ambiguity` is the better fit's error over the other's:
-  near 0 it's clear, near 1 it's a coin toss. Single-tag robot poses above `--max-ambiguity` (default
-  0.2) aren't published. Several tags at once settle it.
+  second is mirrored about the line of sight), and so can several tags on one wall seen from afar.
+  `ambiguity` is the better fit's error over the other's: near 0 it's clear, near 1 it's a coin toss.
+  Single-tag robot poses above `--max-ambiguity` (default 0.2) aren't published. Tags at different
+  depths settle it.
+- **Bounds.** Poses with the robot more than `--max-height` metres off the floor (default 2), tilted
+  more than `--max-tilt` degrees (default 30), or more than 1 m off the field aren't published. The
+  mirror-image pose usually breaks one of these, so the bounds also settle many ambiguities. They
+  assume `--robot-to-camera` is right: a pitched camera with no mount configured looks like a tilted
+  robot.
+- **Fit.** A pose whose corners fit worse than `--corner-noise-px` explains (a 1-in-10,000 chance) isn't
+  published: a tag isn't where the layout says, or the calibration is off.
+
+`pose_rejected` says which of these dropped a pose.
+
+### Uncertainty
+
+`robot_pose_measurement` carries, with the robot's x, y and yaw, the standard deviations of x and y
+along the robot's own forward and left axes, and of yaw, in radians. These are what WPILib's pose
+estimators expect: they apply vision standard deviations in the robot's frame. `robot_pose_covariance`
+has the full 6×6 covariance, along the field's axes, for filters that take one.
+
+They're computed from each frame's geometry: how many corners there are, how far away, how steeply
+seen and how widely spread. So a close pose from several tags is trusted far more than a lone distant
+tag, without a hand-tuned table. Each corner coordinate is assumed to have `--corner-noise-px` of noise
+(default 1, a live setting). Real cameras add blur, rolling shutter and calibration error, which all
+look like corner noise, so 1 px is deliberately cautious. To tune it, log poses while the robot stands
+still, and compare their scatter with the published standard deviations.
+
+The covariance starts from the fit's own (first-order, Gauss-Newton) covariance, then makes two
+adjustments where a single Gaussian at the best fit would be overconfident:
+
+- **Valleys.** Tags seen nearly head-on, or from far away, leave the fit a long, nearly flat valley,
+  for example trading the camera's height against its pitch. The valley through each candidate fit is
+  traced along its least-constrained direction, re-fitting the other five directions at each step, out
+  to where the corners fit clearly worse or the robot leaves the bounds. The covariance covers the
+  traced poses, each weighted by how well it fits. A mirror-image solution that fits nearly as well
+  widens it the same way.
+- **Slack.** 10% of each variance is added back onto itself. This caps every correlation at 0.91, so the
+  covariance can't claim that two errors cancel (a turn and the sideways shift that mimics it) more
+  precisely than they really do.
+
+`tests/uncertainty.rs` checks this by Monte Carlo. It projects tags exactly, adds Gaussian corner noise
+of the assumed size, and counts how often the truth falls outside each published standard deviation's
+95% range (5% would be exact):
+
+| Scene (1 px noise) | x / y / yaw outside | Time per frame |
+| --- | ---: | ---: |
+| One tag, 1-4 m, up to 45° off its normal | 5.8 / 5.5 / 4.8% | 0.11 ms |
+| One tag, 3-6 m, nearly head-on | 4.8 / 6.8 / 6.3% | 0.16 ms |
+| Three tags on a wall, 2-6 m | 3.2 / 3.8 / 3.8% | 0.14 ms |
+| Two tags 40 cm apart, 4-7 m, nearly head-on | 1.2 / 8.8 / 8.0% | 0.25 ms |
+| Tags at two depths, 3.5-6 m | 5.8 / 3.8 / 4.8% | 0.06 ms |
+
+The times are for every tag's pose and the robot's, on one desktop core. The hardest scene, two small
+tags side by side seen head-on from afar, is the one no Gaussian describes well.
 
 On synthetic frames with an exact camera model, tag positions come back within about 0.02% of the
 distance and orientations within a degree (`tests/pose.rs`).
@@ -199,6 +256,9 @@ These can be changed while running, from a dashboard or the robot program, under
 | `min_border_cells` | int | `--min-border-cells` | Dark border cells required, out of 28 (0-28) |
 | `sharpening` | double | `--sharpening` | Cell sharpening for blurred tags (0-1) |
 | `max_ambiguity` | double | `--max-ambiguity` | Single-tag robot poses more ambiguous than this aren't published (0-1) |
+| `corner_noise_px` | double | `--corner-noise-px` | Each corner coordinate's noise, in pixels, that the standard deviations assume (0.01-20) |
+| `max_height` | double | `--max-height` | Robot poses more than this many metres off the floor aren't published (0-20) |
+| `max_tilt` | double | `--max-tilt` | Robot poses tilted more than this many degrees from level aren't published (0-180) |
 | `robot_to_camera` | double[6] | `--robot-to-camera` | The camera's pose on the robot: x, y, z (m), roll, pitch, yaw (degrees) |
 | `stream_auto_levels` | boolean | `--stream-auto-levels` | Stretch the stream to the full grey range (default true) |
 | `stream_gamma` | double | `--stream-gamma` | Stream gamma, 0.1-10; above 1 lifts shadows (default 1) |

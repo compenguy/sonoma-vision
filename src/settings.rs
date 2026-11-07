@@ -1,6 +1,6 @@
 //! Settings that can be changed while running, over NT (see [`crate::nt`]): camera exposure, gain and
-//! focus, the detector's thresholds, the pose solver's mount and ambiguity limit, the camera stream's
-//! look, rate and size, the field layout, and the capture mode.
+//! focus, the detector's thresholds, the pose solver's mount, limits and noise model, the camera
+//! stream's look, rate and size, the field layout, and the capture mode.
 //!
 //! Each starts from the configuration (files and command line) and each has the same name as its
 //! command line option, so the configuration in effect can be written back out with the live values
@@ -12,7 +12,7 @@ use rmpv::Value;
 
 use crate::capture::Mode;
 use crate::detector;
-use crate::pose::MountPose;
+use crate::pose::{MountPose, PoseBounds};
 
 /// Each numeric setting's valid values, for the command line and NT alike.
 pub mod limits {
@@ -26,6 +26,9 @@ pub mod limits {
     pub const STREAM_SCALE: RangeInclusive<i64> = 1..=8;
     pub const SHARPENING: RangeInclusive<f64> = 0.0..=1.0;
     pub const MAX_AMBIGUITY: RangeInclusive<f64> = 0.0..=1.0;
+    pub const CORNER_NOISE_PX: RangeInclusive<f64> = 0.01..=20.0;
+    pub const MAX_HEIGHT: RangeInclusive<f64> = 0.0..=20.0;
+    pub const MAX_TILT: RangeInclusive<f64> = 0.0..=180.0;
     pub const STREAM_GAMMA: RangeInclusive<f64> = 0.1..=10.0;
     pub const STREAM_FPS: RangeInclusive<f64> = 0.1..=1000.0;
 
@@ -59,6 +62,12 @@ pub struct Settings {
     pub sharpening: f64,
     /// Single-tag robot poses more ambiguous than this (0-1) aren't published.
     pub max_ambiguity: f64,
+    /// Each corner coordinate's noise, in pixels, that pose covariances assume.
+    pub corner_noise_px: f64,
+    /// Most metres the robot can be off the floor; poses higher are dropped.
+    pub max_height: f64,
+    /// Most degrees the robot can tilt from level; poses tilted more are dropped.
+    pub max_tilt: f64,
     /// The camera's pose on the robot.
     pub robot_to_camera: MountPose,
     /// Stretch each streamed frame's levels to the full range (the stream only, not detection).
@@ -91,6 +100,9 @@ impl Settings {
         min_border_cells: detector::Config::DEFAULT.min_border_cells,
         sharpening: detector::Config::DEFAULT.sharpening,
         max_ambiguity: 0.2,
+        corner_noise_px: 1.0,
+        max_height: PoseBounds::DEFAULT.max_height,
+        max_tilt: PoseBounds::DEFAULT.max_tilt_deg,
         robot_to_camera: MountPose([0.0; 6]),
         stream_auto_levels: true,
         stream_gamma: 1.0,
@@ -130,6 +142,12 @@ pub enum Key {
     Sharpening,
     /// double, 0-1.
     MaxAmbiguity,
+    /// double, 0.01-20.
+    CornerNoisePx,
+    /// double, 0-20.
+    MaxHeight,
+    /// double, 0-180.
+    MaxTilt,
     /// `double[6]`: x, y, z (metres), roll, pitch, yaw (degrees).
     RobotToCamera,
     /// boolean.
@@ -147,7 +165,7 @@ pub enum Key {
 }
 
 impl Key {
-    pub const ALL: [Key; 16] = [
+    pub const ALL: [Key; 19] = [
         Key::Exposure,
         Key::Gain,
         Key::Focus,
@@ -157,6 +175,9 @@ impl Key {
         Key::MinBorderCells,
         Key::Sharpening,
         Key::MaxAmbiguity,
+        Key::CornerNoisePx,
+        Key::MaxHeight,
+        Key::MaxTilt,
         Key::RobotToCamera,
         Key::StreamAutoLevels,
         Key::StreamGamma,
@@ -178,6 +199,9 @@ impl Key {
             Key::MinBorderCells => "min_border_cells",
             Key::Sharpening => "sharpening",
             Key::MaxAmbiguity => "max_ambiguity",
+            Key::CornerNoisePx => "corner_noise_px",
+            Key::MaxHeight => "max_height",
+            Key::MaxTilt => "max_tilt",
             Key::RobotToCamera => "robot_to_camera",
             Key::StreamAutoLevels => "stream_auto_levels",
             Key::StreamGamma => "stream_gamma",
@@ -215,6 +239,9 @@ impl Settings {
             Key::MinBorderCells => NtValue::Int(i64::from(self.min_border_cells)),
             Key::Sharpening => NtValue::Double(self.sharpening),
             Key::MaxAmbiguity => NtValue::Double(self.max_ambiguity),
+            Key::CornerNoisePx => NtValue::Double(self.corner_noise_px),
+            Key::MaxHeight => NtValue::Double(self.max_height),
+            Key::MaxTilt => NtValue::Double(self.max_tilt),
             Key::RobotToCamera => NtValue::DoubleArray(self.robot_to_camera.0.to_vec()),
             Key::StreamAutoLevels => NtValue::Bool(self.stream_auto_levels),
             Key::StreamGamma => NtValue::Double(self.stream_gamma),
@@ -253,6 +280,9 @@ impl Settings {
             Key::MinBorderCells => self.min_border_cells = int(limits::MIN_BORDER_CELLS)? as u32,
             Key::Sharpening => self.sharpening = real(limits::SHARPENING)?,
             Key::MaxAmbiguity => self.max_ambiguity = real(limits::MAX_AMBIGUITY)?,
+            Key::CornerNoisePx => self.corner_noise_px = real(limits::CORNER_NOISE_PX)?,
+            Key::MaxHeight => self.max_height = real(limits::MAX_HEIGHT)?,
+            Key::MaxTilt => self.max_tilt = real(limits::MAX_TILT)?,
             Key::RobotToCamera => {
                 let v: Option<Vec<f64>> = value.as_array().and_then(|a| a.iter().map(as_number).collect());
                 let v = v.ok_or_else(|| format!("{name} must be a double[6], not {value}"))?;
@@ -374,6 +404,9 @@ mod tests {
         assert!(s.set(Key::MaxHamming, &Value::from(4)).is_err());
         assert!(s.set(Key::MinTagPx, &Value::from(7)).is_err());
         assert!(s.set(Key::Sharpening, &Value::from(1.5)).is_err());
+        assert!(s.set(Key::CornerNoisePx, &Value::from(0.0)).is_err());
+        s.set(Key::MaxTilt, &Value::from(45)).unwrap();
+        assert_eq!(s.max_tilt, 45.0);
         assert!(s.set(Key::StreamScale, &Value::from(9)).is_err());
         let mount = Value::Array([0.3, 0.0, 0.5, 0.0, -15.0, 0.0].map(Value::from).to_vec());
         s.set(Key::RobotToCamera, &mount).unwrap();

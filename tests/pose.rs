@@ -3,7 +3,7 @@
 use nalgebra::{Isometry3, Point3, Rotation3, Translation3, UnitQuaternion, Vector3};
 use sonoma_vision::detector::{Config, Detector, Family, ImageView};
 use sonoma_vision::pose::field::FieldLayout;
-use sonoma_vision::pose::{Estimator, FRC_TAG_SIZE, PoseConfig, tag_corners};
+use sonoma_vision::pose::{Estimator, FRC_TAG_SIZE, PoseBounds, PoseConfig, tag_corners};
 use sonoma_vision::synth::{Canvas, Rng};
 
 const W: usize = 1280;
@@ -17,6 +17,8 @@ fn config(layout: Option<FieldLayout>) -> PoseConfig {
         layout,
         robot_to_camera: Isometry3::identity(),
         max_ambiguity: 0.2,
+        corner_noise_px: 1.0,
+        bounds: PoseBounds::DEFAULT,
     }
 }
 
@@ -126,7 +128,7 @@ fn robot_pose_from_field_tags() {
     let detections = render_and_detect(&est, &tags, 7);
     assert_eq!(detections.len(), 2);
     let poses: Vec<_> = detections.iter().map(|d| est.tag(d)).collect();
-    let field = est.field(&detections, &poses).unwrap();
+    let field = est.field(&detections, &poses).unwrap().unwrap();
     let mut used = field.tags.clone();
     used.sort();
     assert_eq!(used, vec![a, b]);

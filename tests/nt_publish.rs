@@ -129,10 +129,29 @@ async fn publishes_frames_with_server_capture_time() {
         UnitQuaternion::from_euler_angles(0.0, 0.0, std::f64::consts::FRAC_PI_2),
     );
     let tag_pose = TagPose { camera_to_tag, alternate: None, error_px: 0.1, ambiguity: 0.05 };
-    let field_pose = FieldPose { robot, camera: robot, tags: vec![3], error_px: 0.1, ambiguity: 0.05 };
+    let mut covariance = nalgebra::Matrix6::zeros();
+    covariance[(0, 1)] = 0.5;
+    let field_pose = FieldPose {
+        robot,
+        camera: robot,
+        tags: vec![3],
+        error_px: 0.1,
+        ambiguity: 0.05,
+        covariance,
+        std_devs: [0.1, 0.2, 0.03],
+    };
     let record_pose = |pose: &mut HashMap<String, Value>, name: &str, v: &Value| {
         if let Some(key) = name.strip_prefix("/sonoma/test/")
-            && ["robot_pose", "pose_tags", "field/.type", "field/Robot"].contains(&key)
+            && [
+                "robot_pose",
+                "robot_pose_measurement",
+                "robot_pose_covariance",
+                "pose_tags",
+                "pose_rejected",
+                "field/.type",
+                "field/Robot",
+            ]
+            .contains(&key)
         {
             pose.insert(key.to_string(), v.clone());
         }
@@ -199,7 +218,15 @@ async fn publishes_frames_with_server_capture_time() {
         "margin",
         "visible",
     ];
-    let pose_keys = ["robot_pose", "pose_tags", "field/.type", "field/Robot"];
+    let pose_keys = [
+        "robot_pose",
+        "robot_pose_measurement",
+        "robot_pose_covariance",
+        "pose_tags",
+        "pose_rejected",
+        "field/.type",
+        "field/Robot",
+    ];
     let collect = async {
         while !keys.iter().all(|k| tag.contains_key(*k)) || !pose_keys.iter().all(|k| pose.contains_key(*k)) {
             let (name, _, _, v) = vrx.recv().await.unwrap();
@@ -234,6 +261,15 @@ async fn publishes_frames_with_server_capture_time() {
     let expected = [1.0, 2.0, 0.0, half, 0.0, 0.0, half];
     assert!(doubles.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-12), "{doubles:?}");
     assert_eq!(pose["pose_tags"], Value::Array(vec![Value::from(3)]));
+    // What addVisionMeasurement takes, in one value: x, y, yaw (radians), then the standard deviations.
+    let measurement: Vec<f64> =
+        pose["robot_pose_measurement"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+    let expected = [1.0, 2.0, std::f64::consts::FRAC_PI_2, 0.1, 0.2, 0.03];
+    assert!(measurement.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-12), "{measurement:?}");
+    // Row-major: (0, 1) is the second value.
+    let cov: Vec<f64> = pose["robot_pose_covariance"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+    assert_eq!((cov.len(), cov[1], cov[6]), (36, 0.5, 0.0));
+    assert_eq!(pose["pose_rejected"], Value::from(""));
     assert_eq!(pose["field/.type"], Value::from("Field2d"));
     let robot2d: Vec<f64> = pose["field/Robot"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
     assert!((robot2d[0] - 1.0).abs() < 1e-12 && (robot2d[1] - 2.0).abs() < 1e-12 && (robot2d[2] - 90.0).abs() < 1e-9);

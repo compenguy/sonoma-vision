@@ -14,7 +14,7 @@ use crate::capture::{Camera, CameraConfig, CameraState};
 use crate::detector::{Config, Detector, Family};
 use crate::nt::FrameResult;
 use crate::pose::field::FieldLayout;
-use crate::pose::{Estimator, PoseConfig};
+use crate::pose::{Estimator, PoseBounds, PoseConfig};
 use crate::settings::Settings;
 use crate::stream::Tap;
 
@@ -25,6 +25,23 @@ pub struct Setup {
     pub pose: PoseConfig,
     /// The field layouts that can be selected, by name.
     pub layouts: BTreeMap<String, FieldLayout>,
+}
+
+/// The live settings the pose estimator is built from.
+fn pose_settings(s: &Settings) -> impl PartialEq + '_ {
+    (&s.field_layout, s.robot_to_camera, s.max_ambiguity, s.corner_noise_px, s.max_height, s.max_tilt)
+}
+
+/// The startup pose configuration with the live settings applied (all but the layout, which
+/// [`build_estimator`] looks up).
+fn pose_config(pose: &PoseConfig, s: &Settings) -> PoseConfig {
+    PoseConfig {
+        robot_to_camera: s.robot_to_camera.isometry(),
+        max_ambiguity: s.max_ambiguity,
+        corner_noise_px: s.corner_noise_px,
+        bounds: PoseBounds { max_height: s.max_height, max_tilt_deg: s.max_tilt, ..pose.bounds },
+        ..pose.clone()
+    }
 }
 
 /// An estimator for `width` × `height` frames against the layout `name`; None (no pose solving) with
@@ -125,16 +142,9 @@ pub fn run(
                     break;
                 }
                 apply_settings(&camera, family, &mut detector, &mut config, applied.as_ref(), &new);
-                let pose_changed = |old: &Settings| {
-                    (&old.field_layout, old.robot_to_camera, old.max_ambiguity)
-                        != (&new.field_layout, new.robot_to_camera, new.max_ambiguity)
-                };
+                let pose_changed = |old: &Settings| pose_settings(old) != pose_settings(&new);
                 if applied.as_ref().is_none_or(pose_changed) {
-                    let live = PoseConfig {
-                        robot_to_camera: new.robot_to_camera.isometry(),
-                        max_ambiguity: new.max_ambiguity,
-                        ..pose.clone()
-                    };
+                    let live = pose_config(&pose, &new);
                     let name = new.field_layout.as_deref();
                     estimator = build_estimator(&live, &layouts, name, camera.width, camera.height);
                 }
@@ -171,13 +181,15 @@ pub fn run(
             }
             last_frame = Some(t0);
             // With no field layout, no pose solving at all.
-            let (tag_poses, field_pose) = match &estimator {
+            let (tag_poses, field_pose, pose_rejected) = match &estimator {
                 Some(e) => {
                     let tags: Vec<_> = detections.iter().map(|d| e.tag(d)).collect();
-                    let field = e.field(&detections, &tags);
-                    (tags, field)
+                    match e.field(&detections, &tags) {
+                        Ok(field) => (tags, field, None),
+                        Err(why) => (tags, None, Some(why)),
+                    }
                 }
-                None => (vec![None; detections.len()], None),
+                None => (vec![None; detections.len()], None, None),
             };
             let result = FrameResult {
                 sequence: frame.sequence,
@@ -188,6 +200,7 @@ pub fn run(
                 dropped,
                 tag_poses,
                 field_pose,
+                pose_rejected,
             };
             // Only the publisher holds a receiver; if it's gone, the service is shutting down.
             if tx.send(Some(Arc::new(result))).is_err() {
