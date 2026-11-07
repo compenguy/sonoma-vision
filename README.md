@@ -1,14 +1,23 @@
 # sonoma-vision
 
-A standalone AprilTag processor service for the FRC SystemCore controller, in Rust. It captures
-frames from a V4L2 (USB/UVC) camera, detects AprilTags, and publishes them over NetworkTables 4 to the
-robot program running on the same controller.
+A standalone AprilTag processor service for the FRC SystemCore controller, implemented as a Rust
+service built around [napa-vision's C core](https://github.com/zwatx/NAPA/blob/master/src/napa_vision/_native/napa_core.c),
+providing highly optimized SIMD code for the tag detection.
 
-The detector is [napa-vision](https://github.com/zwatx/NAPA)'s C core by Zachary Wilson, vendored in
-`vendor/napa-vision/` and compiled in by `build.rs`. Its sparse-sampling design samples a sparse grid,
+It captures frames from a V4L2 (USB/UVC) camera, detects AprilTags, and publishes them over
+NetworkTables 4 to the robot program running on the same controller.
+
+This absolutely would not be possible without Zachary Wilson's brilliant work on
+[napa-vision](https://github.com/zwatx/NAPA). Its sparse-sampling design samples a sparse grid,
 skips regions without contrast, groups dark runs into blobs, rejects non-tags with a cheap early
-decode, and fits edges and decodes only the tags, at full resolution. See [NOTICE](NOTICE) for credits
-and licensing (GPL-3.0-only).
+decode, and fits edges and decodes only the tags, at full resolution.
+
+## License
+
+sonoma-vision's own code is under your choice of the [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)
+license. napa-vision's core, and the files derived from it, are under the [GPL-3.0-only](LICENSE-GPL),
+and so is the compiled program as a whole. [NOTICE](NOTICE) lists which files are which, with the
+credits and the licenses of other vendored code.
 
 ## Layout
 
@@ -278,8 +287,8 @@ napa-vision's core.
 ### Releases
 
 [Releases](https://github.com/compenguy/sonoma-vision/releases) carry a bundle per platform, each with
-the binary, this README, `LICENSE`, `NOTICE`, the field layouts (`fields/`) and the licenses of
-vendored code built in (`licenses/`):
+the binary, this README, `NOTICE` and the license texts (`LICENSE-*`), the field layouts (`fields/`)
+and the licenses of vendored code built in (`licenses/`):
 
 | Bundle | For |
 | --- | --- |

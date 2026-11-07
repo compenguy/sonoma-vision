@@ -1,3 +1,9 @@
+// Derived from NAPA code.
+// Original work: Copyright (c) 2026 Zachary Wilson.
+// Modifications: Copyright (c) 2026 William Page.
+// SPDX-License-Identifier: GPL-3.0-only
+// Copies and works based on this file must keep this notice and credit Zachary Wilson.
+
 //! napa-vision's C core (vendor/napa-vision, compiled by build.rs) behind [`super::Detector`].
 
 use std::ffi::{CString, c_char, c_int, c_void};

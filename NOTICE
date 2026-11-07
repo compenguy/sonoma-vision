@@ -1,13 +1,32 @@
 sonoma-vision
 Copyright (c) 2026 William Page
 
-sonoma-vision is free software under the GNU General Public License, version 3 only (GPL-3.0-only);
-see LICENSE.
+sonoma-vision is made of files under different licenses.
 
-The AprilTag detector is NAPA's C core (vendor/napa-vision, unmodified), Copyright (c) 2026 Zachary
-Wilson (https://github.com/zwatx/NAPA), used under the GPL-3.0-only. As NAPA's additional term under
-section 7(b) of the GPL requires, works based on NAPA must keep this notice and credit Zachary Wilson
-as NAPA's author in their Appropriate Legal Notices.
+Every file written for sonoma-vision is under your choice of the MIT license (LICENSE-MIT) or the
+Apache License, version 2.0 (LICENSE-APACHE), except the files from or derived from NAPA below.
+
+The compiled program, and the release bundles that carry it, include NAPA's core, so they are
+distributed as a whole under the GNU General Public License, version 3 only (GPL-3.0-only;
+LICENSE-GPL).
+
+NAPA (GPL-3.0-only)
+
+The AprilTag detector is NAPA's C core, Copyright (c) 2026 Zachary Wilson
+(https://github.com/zwatx/NAPA), used under the GPL-3.0-only (LICENSE-GPL). These files are from or
+derived from NAPA, and are under the GPL-3.0-only:
+
+    vendor/napa-vision/     NAPA's C core, unmodified
+    src/detector/napa.rs    derived: Rust bindings to the core's C API
+    src/detector/mod.rs     derived: the detector's settings, after the core's parameters
+
+As NAPA's additional term under section 7(b) of the GPL requires, works based on NAPA must keep this
+notice and credit Zachary Wilson as NAPA's author in their Appropriate Legal Notices. NAPA is also
+available under a commercial license from Zachary Wilson; ask through https://github.com/zwatx/NAPA.
+
+Other third-party code and data
+
+Each keeps its own license.
 
 The tag families' codewords (src/detector/families, generated from vendor/apriltag) come from
 AprilTag (https://github.com/AprilRobotics/apriltag), Copyright (C) 2013-2016, The Regents of The

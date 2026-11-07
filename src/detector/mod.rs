@@ -1,3 +1,9 @@
+// Derived from NAPA code.
+// Original work: Copyright (c) 2026 Zachary Wilson.
+// Modifications: Copyright (c) 2026 William Page.
+// SPDX-License-Identifier: GPL-3.0-only
+// Copies and works based on this file must keep this notice and credit Zachary Wilson.
+
 //! AprilTag detection with napa-vision's C core (Zachary Wilson, GPL-3.0; vendor/napa-vision, compiled
 //! by build.rs): a sparse-sampling detector that samples a sparse grid, skips regions without contrast,
 //! groups dark runs into blobs, rejects non-tags with a cheap early decode, and fits edges and decodes

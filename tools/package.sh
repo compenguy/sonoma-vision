@@ -4,11 +4,12 @@
 #   tools/package.sh <target triple> <bundle name> [--deploy]
 #
 # Writes dist/sonoma-vision-<version>-<bundle name>.tar.gz (and a .sha256 beside it), holding the
-# binary, README.md, LICENSE, NOTICE, the field layouts, and the licenses of vendored code built into
-# the binary; with --deploy, also deploy/ (the systemd unit and example configuration). Build first,
-# e.g. `cargo build --release --target x86_64-unknown-linux-gnu` or tools/build-systemcore.sh.
+# binary, README.md, NOTICE, the LICENSE-* texts, the field layouts, and the licenses of
+# vendored code built into the binary; with --deploy, also deploy/ (the systemd unit and example
+# configuration). Build first, e.g. `cargo build --release --target x86_64-unknown-linux-gnu` or
+# tools/build-systemcore.sh.
 set -eu
-[ $# -ge 2 ] || { sed -n '2,10s/^# \{0,1\}//p' "$0" >&2; exit 2; }
+[ $# -ge 2 ] || { sed -n '2,11s/^# \{0,1\}//p' "$0" >&2; exit 2; }
 target=$1
 name=$2
 deploy=${3:-}
@@ -19,7 +20,7 @@ bin=target/$target/release/sonoma-vision
 dir=sonoma-vision-$version-$name
 rm -rf "dist/$dir" "dist/$dir.tar.gz" "dist/$dir.tar.gz.sha256"
 mkdir -p "dist/$dir/licenses"
-cp "$bin" README.md LICENSE NOTICE "dist/$dir/"
+cp "$bin" README.md LICENSE-GPL LICENSE-MIT LICENSE-APACHE NOTICE "dist/$dir/"
 cp -R fields "dist/$dir/"
 cp vendor/napa-vision/LICENSE "dist/$dir/licenses/napa-vision-LICENSE"
 cp vendor/napa-vision/NOTICE "dist/$dir/licenses/napa-vision-NOTICE"
